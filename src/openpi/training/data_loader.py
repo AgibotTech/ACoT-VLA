@@ -203,7 +203,10 @@ def create_torch_dataset(
         if data_config.prompt_from_hl_instruction:
             for n, d in enumerate(dataset._datasets):
                 dataset._datasets[n] = TransformedDataset(
-                    d,[_transforms.PromptFromHighlevelInstruction(dataset_metas[n].info['instruction_segments'])]
+                    d, [_transforms.PromptFromHighlevelInstruction(
+                        dataset_metas[n].info['instruction_segments'],
+                        high_level_instructions=dataset_metas[n].info.get('high_level_instruction'),
+                    )]
                 )
         for i, d in enumerate(dataset._datasets):
             print(f"Dataset {i} has {len(d)} frames.")
@@ -221,7 +224,10 @@ def create_torch_dataset(
         if data_config.prompt_from_task:
             dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
         if data_config.prompt_from_hl_instruction:
-            dataset = TransformedDataset(dataset, [_transforms.PromptFromHighlevelInstruction(dataset_meta.info['instruction_segments'])])
+            dataset = TransformedDataset(dataset, [_transforms.PromptFromHighlevelInstruction(
+                dataset_meta.info['instruction_segments'],
+                high_level_instructions=dataset_meta.info.get('high_level_instruction'),
+            )])
 
     return dataset
 

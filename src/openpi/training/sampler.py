@@ -42,7 +42,8 @@ def sample_subtask(dataset):
             tasks = instruction_segment[str(ep_idx)]
             for subtask in tasks:
                 local_start = subtask["start_frame_index"] + local_episode_start
-                local_end = subtask["success_frame_index"] + local_episode_start
+                end_frame_key = "success_frame_index" if "success_frame_index" in subtask else "end_frame_index"
+                local_end = subtask[end_frame_key] + local_episode_start
                 
                 instruction = subtask["instruction"].lower()
                 is_reset = any(k in instruction for k in ['reset', 'return', 'default'])

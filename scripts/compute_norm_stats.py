@@ -86,7 +86,7 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
+def main(config_name: str, max_frames: int | None = None, output_path: str = "./"):
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
 
@@ -118,6 +118,8 @@ def main(config_name: str, max_frames: int | None = None):
             continue
 
         for key in keys:
+            if key not in batch:
+                continue
             values = np.asarray(batch[key][0])
             stats[key].update(values.reshape(-1, values.shape[-1]))
 
@@ -126,9 +128,8 @@ def main(config_name: str, max_frames: int | None = None):
 
     pbar.close()
 
-    norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
+    norm_stats = {key: s.get_statistics() for key, s in stats.items() if s._count > 0}
 
-    output_path = "./"
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 

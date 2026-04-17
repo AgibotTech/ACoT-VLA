@@ -1,9 +1,14 @@
 import dataclasses
 import enum
 import logging
+import os
 import socket
 
 import tyro
+
+os.environ.setdefault("XLA_FLAGS", "")
+if "--xla_gpu_enable_triton_gemm=false" not in os.environ["XLA_FLAGS"]:
+    os.environ["XLA_FLAGS"] += " --xla_gpu_enable_triton_gemm=false"
 
 from openpi.policies import policy as _policy
 from openpi.policies import policy_config as _policy_config
@@ -21,6 +26,16 @@ class EnvMode(enum.Enum):
     VLABENCH = "vlabench"
     LIBEROPLUS = "liberoplus"
     G2SIM = "g2sim"
+    CALVIN = "calvin"
+    G1 = "g1"
+    S2R_SELECT_COLOR = "s2r_select_color"
+    S2R_SIZE_RECOGNIZE = "s2r_size_recognize"
+    S2R_GRASP_TARGETS = "s2r_grasp_targets"
+    S2R_ORGANIZE_ITEMS = "s2r_organize_items"
+    S2R_SORT_FRUIT = "s2r_sort_fruit"
+    S2R_PACK_IN_SUPERMARKET = "s2r_pack_in_supermarket"
+    S2R_BIMANUAL_CHIP_HANDOVER = "s2r_bimanual_chip_handover"
+    S2R_PLACE_BLOCK_INTO_DRAWER = "s2r_place_block_into_drawer"
 
 
 @dataclasses.dataclass
@@ -49,6 +64,7 @@ class Args:
     # prompt.
     default_prompt: str | None = None
 
+    host: str = "0.0.0.0"
     # Port to serve the policy on.
     port: int = 8000
     # Record the policy's behavior for debugging.
@@ -87,7 +103,39 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
     EnvMode.G2SIM: Checkpoint(
         config="acot_icra_simulation_challenge_reasoning_to_action",
         dir="./checkpoints/acot_icra_simulation_challenge_reasoning_to_action/exp_name/30000",
-    )
+    ),
+    EnvMode.S2R_SELECT_COLOR: Checkpoint(
+        config="s2r_select_color",
+        dir="./checkpoints/select_color/",
+    ),
+    EnvMode.S2R_SIZE_RECOGNIZE: Checkpoint(
+        config="s2r_size_recognize",
+        dir="./checkpoints/size_recognize/",
+    ),
+    EnvMode.S2R_GRASP_TARGETS: Checkpoint(
+        config="s2r_grasp_targets",
+        dir="./checkpoints/grasp_targets/",
+    ),
+    EnvMode.S2R_ORGANIZE_ITEMS: Checkpoint(
+        config="s2r_organize_items",
+        dir="./checkpoints/organize_items/",
+    ),
+    EnvMode.S2R_SORT_FRUIT: Checkpoint(
+        config="s2r_sort_fruit",
+        dir="./checkpoints/sort_fruit/",
+    ),
+    EnvMode.S2R_PACK_IN_SUPERMARKET: Checkpoint(
+        config="s2r_pack_in_supermarket",
+        dir="./checkpoints/pack_in_supermarket/",
+    ),
+    EnvMode.S2R_BIMANUAL_CHIP_HANDOVER: Checkpoint(
+        config="s2r_bimanual_chip_handover",
+        dir="./checkpoints/bimanual_chip_handover/",
+    ),
+    EnvMode.S2R_PLACE_BLOCK_INTO_DRAWER: Checkpoint(
+        config="s2r_place_block_into_drawer",
+        dir="./checkpoints/place_block_into_drawer/",
+    ),
 }
 
 
@@ -125,7 +173,7 @@ def main(args: Args) -> None:
 
     server = websocket_policy_server.WebsocketPolicyServer(
         policy=policy,
-        host="0.0.0.0",
+        host=args.host,
         port=args.port,
         metadata=policy_metadata,
     )

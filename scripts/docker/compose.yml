@@ -6,6 +6,7 @@ services:
     build:
       context: ../..
       dockerfile: scripts/docker/serve_policy.Dockerfile
+      network: host
     init: true
     tty: true
     network_mode: host

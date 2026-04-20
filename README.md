@@ -131,6 +131,12 @@ bash scripts/server.sh <GPU_ID> <PORT>
 
 ```
 
+Before adapting a new LeRobot dataset or robot client, see the [ACoT adapter guide](docs/acot_adapter_guide.md). You can inspect a config without checkpoints or GPUs:
+
+```bash
+uv run python scripts/inspect_acot_adapter.py --config-name <CONFIG_NAME>
+```
+
 ---
 
 ## 📅 TODO List

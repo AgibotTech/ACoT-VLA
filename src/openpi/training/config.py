@@ -2079,6 +2079,86 @@ _CONFIGS = [
             freeze_vision = False, freeze_llm = True, freeze_llm_embedder=True, freeze_dual_ae=[False, False]
         )
     ),
+    # genie sim 10 mini tasks (pi0.5)
+    TrainConfig(
+        name="pi05_genie_sim_10_mini_task_20260312",
+        model=pi0.Pi0Config(pi05=True, action_horizon=50, discrete_state_input=True),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/mnt/public/linyiren/data/geniesim/pick_block_color_500",
+                "/mnt/public/linyiren/data/geniesim/pick_block_number_500",
+                "/mnt/public/linyiren/data/geniesim/pick_block_shape_500",
+                "/mnt/public/linyiren/data/geniesim/pick_block_size_500",
+                "/mnt/public/linyiren/data/geniesim/pick_common_sense_500",
+                "/mnt/public/linyiren/data/geniesim/pick_object_type_500",
+                "/mnt/public/linyiren/data/geniesim/pick_specific_object_500",
+                "/mnt/public/linyiren/data/geniesim/straighten_object_500",
+                "/mnt/public/linyiren/data/geniesim/pick_follow_logic_(or)_500",
+                "/mnt/public/jincheng/data/pick_billards_color_500",
+            ],
+            assets=AssetsConfig(
+                assets_dir=None,
+                asset_id="/mnt/public/zhonglinqing/data/datasets/genie_sim_icra_datasets/ten_mini_task_merge_vanilla_20260213",
+            ),
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        resume=True,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/public/zhonglinqing/pkgs/pi05_model/params"),
+        num_workers=24 if not os.getenv("DEBUG_MODE", default=False) == "true" else 2,
+        batch_size=256 if not os.getenv("DEBUG_MODE", default=False) == "true" else 2,
+        num_train_steps=50_000,
+        save_interval=5000 if not os.getenv("DEBUG_MODE", default=False) == "true" else 1000,
+    ),
+    # genie sim 10 mini tasks (pi0)
+    TrainConfig(
+        name="pi0_genie_sim_10_mini_task_20260312",
+        model=pi0.Pi0Config(pi05=False, action_horizon=50),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/mnt/public/linyiren/data/geniesim/pick_block_color_500",
+                "/mnt/public/linyiren/data/geniesim/pick_block_number_500",
+                "/mnt/public/linyiren/data/geniesim/pick_block_shape_500",
+                "/mnt/public/linyiren/data/geniesim/pick_block_size_500",
+                "/mnt/public/linyiren/data/geniesim/pick_common_sense_500",
+                "/mnt/public/linyiren/data/geniesim/pick_object_type_500",
+                "/mnt/public/linyiren/data/geniesim/pick_specific_object_500",
+                "/mnt/public/linyiren/data/geniesim/straighten_object_500",
+                "/mnt/public/linyiren/data/geniesim/pick_follow_logic_(or)_500",
+                "/mnt/public/jincheng/data/pick_billards_color_500",
+            ],
+            assets=AssetsConfig(
+                assets_dir=None,
+                asset_id="/mnt/public/zhonglinqing/data/datasets/genie_sim_icra_datasets/ten_mini_task_merge_vanilla_20260213",
+            ),
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        resume=True,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/public/public_datasets/VLA_weigths/PI0/params"),
+        num_workers=24 if not os.getenv("DEBUG_MODE", default=False) == "true" else 2,
+        batch_size=256 if not os.getenv("DEBUG_MODE", default=False) == "true" else 2,
+        num_train_steps=50_000,
+        save_interval=5000 if not os.getenv("DEBUG_MODE", default=False) == "true" else 1000,
+    ),
     # genie sim 3.0 sim2real task config
     TrainConfig(
         name="s2r_select_color",

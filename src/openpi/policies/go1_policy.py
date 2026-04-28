@@ -78,9 +78,9 @@ class Go1Inputs(transforms.DataTransformFn):
         return actions
 
     def __call__(self, data: dict) -> dict:
-        state = transforms.pad_to_dim(data["state"], self.action_dim)
-        state = copy.deepcopy(state)
+        state = copy.deepcopy(data["state"])
         state = self._remap_state(state)
+        state = transforms.pad_to_dim(state, self.action_dim)
         state = state.squeeze()
 
         images = {}

@@ -40,7 +40,7 @@ def create_torch_dataloader(
             RemoveStrings(),
         ],
     )
-    # dataset = _data_loader.SafeDataset(dataset)
+    dataset = _data_loader.SafeDataset(dataset)
     if max_frames is not None and max_frames < len(dataset):
         num_batches = max_frames // batch_size
         shuffle = True
@@ -102,7 +102,7 @@ def main(config_name: str, max_frames: int | None = None, output_path: str = "./
     keys = ["state", "actions", "coarse_actions"]
     stats = {key: normalize.RunningStats() for key in keys}
 
-    sample_ratio = 0.1
+    sample_ratio = 0.2
     max_batches = int(num_batches * sample_ratio)
 
     data_iter = iter(data_loader)

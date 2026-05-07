@@ -40,7 +40,7 @@ def create_torch_dataloader(
             RemoveStrings(),
         ],
     )
-    # dataset = _data_loader.SafeDataset(dataset)
+    dataset = _data_loader.SafeDataset(dataset)
     if max_frames is not None and max_frames < len(dataset):
         num_batches = max_frames // batch_size
         shuffle = True
@@ -86,7 +86,7 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
+def main(config_name: str, max_frames: int | None = None, output_path: str = "./"):
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
 
@@ -102,7 +102,7 @@ def main(config_name: str, max_frames: int | None = None):
     keys = ["state", "actions", "coarse_actions"]
     stats = {key: normalize.RunningStats() for key in keys}
 
-    sample_ratio = 0.1
+    sample_ratio = 0.2
     max_batches = int(num_batches * sample_ratio)
 
     data_iter = iter(data_loader)
@@ -118,6 +118,8 @@ def main(config_name: str, max_frames: int | None = None):
             continue
 
         for key in keys:
+            if key not in batch:
+                continue
             values = np.asarray(batch[key][0])
             stats[key].update(values.reshape(-1, values.shape[-1]))
 
@@ -126,9 +128,8 @@ def main(config_name: str, max_frames: int | None = None):
 
     pbar.close()
 
-    norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
+    norm_stats = {key: s.get_statistics() for key, s in stats.items() if s._count > 0}
 
-    output_path = "./"
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 

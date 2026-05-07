@@ -196,6 +196,9 @@ class DataConfigFactory(abc.ABC):
     # Base config that will be updated by the factory.
     base_config: tyro.conf.Suppress[DataConfig | None] = None
 
+    state_mask = None
+    action_mask = None
+
     @abc.abstractmethod
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         """Create a data config."""
@@ -203,13 +206,60 @@ class DataConfigFactory(abc.ABC):
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
         asset_id = self.assets.asset_id or repo_id
+        norm_stats_path = getattr(self, 'norm_stats_path', None)
+        if isinstance(norm_stats_path, str):
+            if os.path.exists(norm_stats_path):
+                norm_stats = self._load_norm_stats_from_json(norm_stats_path)
+            else:
+                logging.warning("norm_stats_path=%s does not exist, falling back to assets.", norm_stats_path)
+                norm_stats = self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id)
+        else:
+            norm_stats = self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id)
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
             asset_id=asset_id,
-            norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
+            norm_stats=norm_stats,
             use_quantile_norm=False,
         )
+
+    def _aggregate_norm_stats(
+        self, all_norm_stats: list[dict[str, _transforms.NormStats]]
+    ) -> dict[str, _transforms.NormStats]:
+        from openpi.shared.normalize import NormStats
+
+        agg = {}
+        for key in all_norm_stats[0].keys():
+            agg[key] = NormStats(
+                mean=np.mean([ns[key].mean for ns in all_norm_stats], axis=0),
+                std=np.mean([ns[key].std for ns in all_norm_stats], axis=0),
+                q01=np.mean([ns[key].q01 for ns in all_norm_stats], axis=0),
+                q99=np.mean([ns[key].q99 for ns in all_norm_stats], axis=0),
+            )
+        return agg
+
+    def _apply_norm_stats_mask(self, norm_stats: dict[str, _transforms.NormStats]) -> None:
+        if self.state_mask is not None and "state" in norm_stats:
+            state_mask = np.asarray(self.state_mask)
+            state_len = norm_stats["state"].std.shape[0]
+            dims = min(state_mask.shape[-1], state_len)
+            if dims > 0:
+                m = state_mask[:dims]
+                norm_stats["state"].std[m] = 1e6
+                norm_stats["state"].mean[m] = 0
+                norm_stats["state"].q01[m] = 0
+                norm_stats["state"].q99[m] = 0
+
+        if self.action_mask is not None and "actions" in norm_stats:
+            action_mask = np.asarray(self.action_mask)
+            action_len = norm_stats["actions"].std.shape[0]
+            dims = min(action_mask.shape[-1], action_len)
+            if dims > 0:
+                m = action_mask[:dims]
+                norm_stats["actions"].std[m] = 1e6
+                norm_stats["actions"].mean[m] = 0
+                norm_stats["actions"].q01[m] = 0
+                norm_stats["actions"].q99[m] = 0
 
     def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:
         if asset_id is None:
@@ -218,35 +268,41 @@ class DataConfigFactory(abc.ABC):
             if not isinstance(asset_id, list):
                 asset_id = [asset_id]
 
-            # mean of those norm stats:
             all_norm_stats = []
-            # asset_id = asset_id[0] #! use the norm stats from the first episode
             for a_id in asset_id:
                 data_assets_dir = str(assets_dir / a_id)
                 norm_stats = _normalize.load(_download.maybe_download(data_assets_dir))
                 logging.info(f"Loaded norm stats from {data_assets_dir}")
                 all_norm_stats.append(norm_stats)
-            
-            agg = {}
-            
-            for key in all_norm_stats[0].keys():
-                from openpi.shared.normalize import NormStats
-                agg[key] = NormStats(
-                    mean = np.mean([norm_stats[key].mean for norm_stats in all_norm_stats], axis=0), 
-                    std = np.mean([norm_stats[key].std for norm_stats in all_norm_stats], axis=0),
-                    q01 = np.mean([norm_stats[key].q01 for norm_stats in all_norm_stats], axis=0),
-                    q99 = np.mean([norm_stats[key].q99 for norm_stats in all_norm_stats], axis=0),
-                )
 
-
-            norm_stats = agg
-
-            # data_assets_dir = str(assets_dir / asset_id)
-            # norm_stats = _normalize.load(_download.maybe_download(data_assets_dir))
-            # logging.info(f"Loaded norm stats from {data_assets_dir}")
+            norm_stats = self._aggregate_norm_stats(all_norm_stats)
+            self._apply_norm_stats_mask(norm_stats)
             return norm_stats
         except FileNotFoundError:
             logging.info(f"Norm stats not found in {data_assets_dir}, skipping.")
+        return None
+
+    def _load_norm_stats_from_json(self, json_path: str) -> dict[str, _transforms.NormStats] | None:
+        if json_path is None:
+            return None
+        try:
+            from openpi.shared.normalize import deserialize_json
+
+            if not isinstance(json_path, list):
+                json_path = [json_path]
+
+            all_norm_stats = []
+            for j_path in json_path:
+                json_file_path = pathlib.Path(j_path)
+                norm_stats = deserialize_json(json_file_path.read_text())
+                logging.info(f"Loaded norm stats from {json_file_path}")
+                all_norm_stats.append(norm_stats)
+
+            norm_stats = self._aggregate_norm_stats(all_norm_stats)
+            self._apply_norm_stats_mask(norm_stats)
+            return norm_stats
+        except FileNotFoundError:
+            logging.info(f"Norm stats not found in {json_file_path}, skipping.")
         return None
 
 
@@ -1147,6 +1203,93 @@ class LerobotACOTARXDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LerobotGo1DataConfig(DataConfigFactory):
+    use_delta_joint_actions: bool = True
+    default_prompt: str | None = None
+    norm_stats_path: str | None = None
+
+    state_keys: Sequence[str] = ("state/joint/position", "state/left_effector/position", "state/right_effector/position")
+    action_keys: Sequence[str] = ("action/joint/position", "action/left_effector/position", "action/right_effector/position")
+
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "top_head": "observation.images.top_head",
+                            "hand_left": "observation.images.hand_left",
+                            "hand_right": "observation.images.hand_right",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+    )
+
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    mask_gripper_state: bool = False
+    output_dim: int = 22
+
+    state_mask = np.array(_transforms.make_bool_mask(-16, 16))
+    action_mask = np.array(_transforms.make_bool_mask(-16, 16))
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
+
+        state_indices = None
+        action_indices = None
+        if repo_id is not None:
+            try:
+                state_indices = tuple(go1_policy.load_field_indices(repo_id, "observation.state", self.state_keys))
+                action_indices = tuple(go1_policy.load_field_indices(repo_id, "action", self.action_keys))
+            except (FileNotFoundError, KeyError) as e:
+                logging.warning("Could not load field indices from info.json, falling back to no remapping: %s", e)
+
+        if self.mask_gripper_state:
+            state_mask = np.array(_transforms.make_bool_mask(-14, 18))
+        else:
+            state_mask = np.array(_transforms.make_bool_mask(-16, 16))
+
+        data_transforms = _transforms.Group(
+            inputs=[
+                go1_policy.Go1Inputs(
+                    action_dim=model_config.action_dim,
+                    model_type=model_config.model_type,
+                    state_mask=state_mask,
+                    action_mask=self.action_mask,
+                    state_indices=state_indices,
+                    action_indices=action_indices,
+                )
+            ],
+            outputs=[go1_policy.Go1Outputs(output_dim=self.output_dim)],
+        )
+
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(14, -2, 6)
+
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -1936,7 +2079,235 @@ _CONFIGS = [
         freeze_filter = acot_vla.ACOTConfig(paligemma_variant="gemma_2b_lora").get_freeze_filter(
             freeze_vision = False, freeze_llm = True, freeze_llm_embedder=True, freeze_dual_ae=[False, False]
         )
-    )
+    ),
+    # genie sim 10 mini tasks (pi0.5)
+    TrainConfig(
+        name="pi05_genie_sim_10_mini_task_20260312",
+        model=pi0.Pi0Config(pi05=True, action_horizon=50, discrete_state_input=True),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/mnt/public/linyiren/data/geniesim/pick_block_color_500",
+                "/mnt/public/linyiren/data/geniesim/pick_block_number_500",
+                "/mnt/public/linyiren/data/geniesim/pick_block_shape_500",
+                "/mnt/public/linyiren/data/geniesim/pick_block_size_500",
+                "/mnt/public/linyiren/data/geniesim/pick_common_sense_500",
+                "/mnt/public/linyiren/data/geniesim/pick_object_type_500",
+                "/mnt/public/linyiren/data/geniesim/pick_specific_object_500",
+                "/mnt/public/linyiren/data/geniesim/straighten_object_500",
+                "/mnt/public/linyiren/data/geniesim/pick_follow_logic_(or)_500",
+                "/mnt/public/jincheng/data/pick_billards_color_500",
+            ],
+            assets=AssetsConfig(
+                assets_dir=None,
+                asset_id="/mnt/public/zhonglinqing/data/datasets/genie_sim_icra_datasets/ten_mini_task_merge_vanilla_20260213",
+            ),
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            output_dim=16,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        resume=True,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/public/zhonglinqing/pkgs/pi05_model/params"),
+        num_workers=24 if not os.getenv("DEBUG_MODE", default=False) == "true" else 2,
+        batch_size=256 if not os.getenv("DEBUG_MODE", default=False) == "true" else 2,
+        num_train_steps=50_000,
+        save_interval=5000 if not os.getenv("DEBUG_MODE", default=False) == "true" else 1000,
+    ),
+    # genie sim 10 mini tasks (pi0)
+    TrainConfig(
+        name="pi0_genie_sim_10_mini_task_20260312",
+        model=pi0.Pi0Config(pi05=False, action_horizon=50),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/mnt/public/linyiren/data/geniesim/pick_block_color_500",
+                "/mnt/public/linyiren/data/geniesim/pick_block_number_500",
+                "/mnt/public/linyiren/data/geniesim/pick_block_shape_500",
+                "/mnt/public/linyiren/data/geniesim/pick_block_size_500",
+                "/mnt/public/linyiren/data/geniesim/pick_common_sense_500",
+                "/mnt/public/linyiren/data/geniesim/pick_object_type_500",
+                "/mnt/public/linyiren/data/geniesim/pick_specific_object_500",
+                "/mnt/public/linyiren/data/geniesim/straighten_object_500",
+                "/mnt/public/linyiren/data/geniesim/pick_follow_logic_(or)_500",
+                "/mnt/public/jincheng/data/pick_billards_color_500",
+            ],
+            assets=AssetsConfig(
+                assets_dir=None,
+                asset_id="/mnt/public/zhonglinqing/data/datasets/genie_sim_icra_datasets/ten_mini_task_merge_vanilla_20260213",
+            ),
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        resume=True,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/public/public_datasets/VLA_weigths/PI0/params"),
+        num_workers=24 if not os.getenv("DEBUG_MODE", default=False) == "true" else 2,
+        batch_size=256 if not os.getenv("DEBUG_MODE", default=False) == "true" else 2,
+        num_train_steps=50_000,
+        save_interval=5000 if not os.getenv("DEBUG_MODE", default=False) == "true" else 1000,
+    ),
+    # genie sim 3.0 sim2real task config
+    TrainConfig(
+        name="s2r_select_color",
+        model=pi0.Pi0Config(pi05=True),
+        data=LerobotGo1DataConfig(
+            repo_id="/root/openpi/data/select_color/",
+            norm_stats_path="/root/openpi/checkpoints/select_color/29999/norm_stats.json",
+            default_prompt="",
+            use_delta_joint_actions=True,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_may21_280k_v1/params"),
+        exp_name="s2r_select_color",
+        num_train_steps=30_000,
+        num_workers=24,
+        batch_size=32 * 8,
+        save_interval=5000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="s2r_size_recognize",
+        model=pi0.Pi0Config(pi05=True),
+        data=LerobotGo1DataConfig(
+            repo_id="/root/openpi/data/recognize_size/",
+            norm_stats_path="/root/openpi/checkpoints/recognize_size/29999/norm_stats.json",
+            default_prompt="",
+            use_delta_joint_actions=True,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_may21_280k_v1/params"),
+        exp_name="s2r_size_recognize",
+        num_train_steps=30_000,
+        num_workers=24,
+        batch_size=32 * 8,
+        save_interval=5000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="s2r_grasp_targets",
+        model=pi0.Pi0Config(pi05=True),
+        data=LerobotGo1DataConfig(
+            repo_id="/root/openpi/data/grasp_targets/",
+            norm_stats_path="/root/openpi/checkpoints/grasp_targets/29999/norm_stats.json",
+            default_prompt="",
+            use_delta_joint_actions=True,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_may21_280k_v1/params"),
+        exp_name="s2r_grasp_targets",
+        num_train_steps=30_000,
+        num_workers=24,
+        batch_size=32 * 8,
+        save_interval=5000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="s2r_organize_items",
+        model=pi0.Pi0Config(pi05=True),
+        data=LerobotGo1DataConfig(
+            repo_id="/root/openpi/data/organize_items/",
+            norm_stats_path="/root/openpi/checkpoints/organize_items/29999/norm_stats.json",
+            default_prompt="",
+            use_delta_joint_actions=True,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_may21_280k_v1/params"),
+        exp_name="s2r_organize_items",
+        num_train_steps=30_000,
+        num_workers=24,
+        batch_size=32 * 8,
+        save_interval=5000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="s2r_pack_in_supermarket",
+        model=pi0.Pi0Config(pi05=True),
+        data=LerobotGo1DataConfig(
+            repo_id="/mnt/public/E6/lerobot/8782/task_6944/",
+            norm_stats_path="/mnt/jincheng/train/lerobot/task_6944/norm_stats.json",
+            default_prompt="collect and organize table tennis",
+            use_delta_joint_actions=True,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_may21_280k_v1/params"),
+        exp_name="s2r_pack_in_supermarket",
+        num_train_steps=30_000,
+        num_workers=24,
+        batch_size=32 * 8,
+        save_interval=5000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="s2r_place_block_into_drawer",
+        model=pi0.Pi0Config(pi05=True),
+        data=LerobotGo1DataConfig(
+            repo_id="/mnt/public/jincheng/data/drawer/",
+            norm_stats_path="/mnt/jincheng/train/lerobot/task_7070/norm_stats.json",
+            default_prompt="organize the block into the drawer",
+            use_delta_joint_actions=True,
+            mask_gripper_state=True,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_may21_280k_v1/params"),
+        exp_name="s2r_place_block_into_drawer",
+        num_train_steps=30_000,
+        num_workers=24,
+        batch_size=32 * 8,
+        save_interval=5000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="s2r_bimanual_chip_handover",
+        model=pi0.Pi0Config(pi05=True),
+        data=LerobotGo1DataConfig(
+            repo_id="/mnt/jincheng/data/handover_chips",
+            norm_stats_path="/mnt/jincheng/train/lerobot/task_7332/norm_stats.json",
+            default_prompt="Handover chips",
+            use_delta_joint_actions=True,
+            mask_gripper_state=True,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_may21_280k_v1/params"),
+        exp_name="s2r_bimanual_chip_handover",
+        num_train_steps=30_000,
+        num_workers=24,
+        batch_size=32 * 8,
+        save_interval=5000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="s2r_sort_fruit",
+        model=pi0.Pi0Config(pi05=True),
+        data=LerobotGo1DataConfig(
+            repo_id="/mnt/public/jincheng/data/sort_fruit",
+            norm_stats_path="/mnt/jincheng/train/lerobot/task_7453/norm_stats.json",
+            default_prompt="Sort the fruit",
+            use_delta_joint_actions=True,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_may21_280k_v1/params"),
+        exp_name="s2r_sort_fruit",
+        num_train_steps=15_000,
+        num_workers=24,
+        batch_size=32 * 8,
+        save_interval=5000,
+        wandb_enabled=False,
+    ),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

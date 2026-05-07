@@ -137,13 +137,15 @@ class Normalize(DataTransformFn):
         )
 
     def _normalize(self, x, stats: NormStats):
-        mean, std = stats.mean[..., : x.shape[-1]], stats.std[..., : x.shape[-1]]
+        mean = pad_to_dim(stats.mean, x.shape[-1], axis=-1, value=0.0)
+        std = pad_to_dim(stats.std, x.shape[-1], axis=-1, value=1.0)
         return (x - mean) / (std + 1e-6)
 
     def _normalize_quantile(self, x, stats: NormStats):
         assert stats.q01 is not None
         assert stats.q99 is not None
-        q01, q99 = stats.q01[..., : x.shape[-1]], stats.q99[..., : x.shape[-1]]
+        q01 = pad_to_dim(stats.q01, x.shape[-1], axis=-1, value=0.0)
+        q99 = pad_to_dim(stats.q99, x.shape[-1], axis=-1, value=1.0)
         return (x - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
 
 
@@ -177,9 +179,8 @@ class Unnormalize(DataTransformFn):
     def _unnormalize_quantile(self, x, stats: NormStats):
         assert stats.q01 is not None
         assert stats.q99 is not None
-        q01, q99 = stats.q01, stats.q99
-        if (dim := q01.shape[-1]) < x.shape[-1]:
-            return np.concatenate([(x[..., :dim] + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01, x[..., dim:]], axis=-1)
+        q01 = pad_to_dim(stats.q01, x.shape[-1], axis=-1, value=0.0)
+        q99 = pad_to_dim(stats.q99, x.shape[-1], axis=-1, value=1.0)
         return (x + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
 
 
@@ -226,8 +227,8 @@ class DeltaActions(DataTransformFn):
 
         state, actions = data["state"], data["actions"]
         mask = np.asarray(self.mask)
-        dims = mask.shape[-1]
-        actions[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
+        dims = min(mask.shape[-1], state.shape[-1])
+        actions[..., :dims] -= np.expand_dims(np.where(mask[:dims], state[..., :dims], 0), axis=-2)
         data["actions"] = actions
 
         return data
@@ -248,8 +249,8 @@ class AbsoluteActions(DataTransformFn):
 
         state, actions = data["state"], data["actions"]
         mask = np.asarray(self.mask)
-        dims = mask.shape[-1]
-        actions[..., :dims] += np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
+        dims = min(mask.shape[-1], state.shape[-1])
+        actions[..., :dims] += np.expand_dims(np.where(mask[:dims], state[..., :dims], 0), axis=-2)
         data["actions"] = actions
 
         return data
@@ -378,6 +379,7 @@ class PromptFromHighlevelInstruction(DataTransformFn):
 
     # Contains the LeRobot dataset tasks (dataset.meta.tasks).
     instruction_segments: dict
+    high_level_instructions: dict | None = None
 
     def __call__(self, data: DataDict) -> DataDict:
         if "episode_index" not in data:
@@ -387,18 +389,25 @@ class PromptFromHighlevelInstruction(DataTransformFn):
         frame_index = int(data["frame_index"])
         segments = self.instruction_segments.get(str(episode_index))
 
-        segment_id = len(segments) - 1
+        segment_id = None
         segments[0]['start_frame_index'] = 0
         for i, segment in enumerate(segments):
             if frame_index >= segment['start_frame_index'] and frame_index < segment['end_frame_index']:
                 segment_id = i
                 break
-        
-        if segment_id is not None:
-            segment = segments[segment_id]
-            instruction = segment['instruction']
-        else:
-            raise ValueError(f"No segment found for episode {episode_index} and frame {frame_index}")
+
+        if segment_id is None:
+            segment_id = len(segments) - 1
+
+        instruction = segments[segment_id]['instruction']
+
+        if self.high_level_instructions is not None:
+            hl = self.high_level_instructions.get(str(episode_index))
+            if hl is not None:
+                hl_text = hl.get("high_level_instruction", "") if isinstance(hl, dict) else ""
+                if hl_text:
+                    instruction = hl_text
+
         return {**data, "prompt": instruction}
 
 @dataclasses.dataclass(frozen=True)
@@ -511,12 +520,16 @@ def apply_tree(
 
 
 def pad_to_dim(x: np.ndarray, target_dim: int, axis: int = -1, value: float = 0.0) -> np.ndarray:
-    """Pad an array to the target dimension with zeros along the specified axis."""
+    """Pad or truncate an array to the target dimension along the specified axis."""
     current_dim = x.shape[axis]
     if current_dim < target_dim:
         pad_width = [(0, 0)] * len(x.shape)
         pad_width[axis] = (0, target_dim - current_dim)
         return np.pad(x, pad_width, constant_values=value)
+    if current_dim > target_dim:
+        slices = [slice(None)] * len(x.shape)
+        slices[axis] = slice(0, target_dim)
+        return x[tuple(slices)]
     return x
 
 

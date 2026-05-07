@@ -6,6 +6,7 @@ from typing import Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
+import random
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
@@ -37,10 +38,14 @@ class SafeDataset(Dataset):
 
     def __getitem__(self, index: SupportsIndex):
         try:
-            return self.dataset[index]
+            val = self.dataset[index]
+            if val is None:
+                raise ValueError("Dataset returned None")
+            return val
         except Exception as e:
-            print(f"[Data Load Error] Skipping index {index} due to: {e}")
-            return None
+            print(f"[Data Load Error] Index {index} failed due to: {e}. Resampling...")
+            new_index = random.randint(0, len(self.dataset) - 1)
+            return self.__getitem__(new_index)
     
     def __getattr__(self, name):
         if name == 'dataset':
@@ -203,7 +208,10 @@ def create_torch_dataset(
         if data_config.prompt_from_hl_instruction:
             for n, d in enumerate(dataset._datasets):
                 dataset._datasets[n] = TransformedDataset(
-                    d,[_transforms.PromptFromHighlevelInstruction(dataset_metas[n].info['instruction_segments'])]
+                    d, [_transforms.PromptFromHighlevelInstruction(
+                        dataset_metas[n].info['instruction_segments'],
+                        high_level_instructions=dataset_metas[n].info.get('high_level_instruction'),
+                    )]
                 )
         for i, d in enumerate(dataset._datasets):
             print(f"Dataset {i} has {len(d)} frames.")
@@ -221,7 +229,10 @@ def create_torch_dataset(
         if data_config.prompt_from_task:
             dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
         if data_config.prompt_from_hl_instruction:
-            dataset = TransformedDataset(dataset, [_transforms.PromptFromHighlevelInstruction(dataset_meta.info['instruction_segments'])])
+            dataset = TransformedDataset(dataset, [_transforms.PromptFromHighlevelInstruction(
+                dataset_meta.info['instruction_segments'],
+                high_level_instructions=dataset_meta.info.get('high_level_instruction'),
+            )])
 
     return dataset
 

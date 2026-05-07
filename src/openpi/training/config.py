@@ -1233,6 +1233,7 @@ class LerobotGo1DataConfig(DataConfigFactory):
     action_sequence_keys: Sequence[str] = ("action",)
 
     mask_gripper_state: bool = False
+    output_dim: int = 22
 
     state_mask = np.array(_transforms.make_bool_mask(-16, 16))
     action_mask = np.array(_transforms.make_bool_mask(-16, 16))
@@ -1266,7 +1267,7 @@ class LerobotGo1DataConfig(DataConfigFactory):
                     action_indices=action_indices,
                 )
             ],
-            outputs=[go1_policy.Go1Outputs()],
+            outputs=[go1_policy.Go1Outputs(output_dim=self.output_dim)],
         )
 
         if self.use_delta_joint_actions:
@@ -2102,6 +2103,7 @@ _CONFIGS = [
             ),
             default_prompt=None,
             use_delta_joint_actions=True,
+            output_dim=16,
             base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
         ),
         lr_schedule=_optimizer.CosineDecaySchedule(

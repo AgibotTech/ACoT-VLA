@@ -118,8 +118,10 @@ class Go1Inputs(transforms.DataTransformFn):
 @dataclasses.dataclass(frozen=True)
 class Go1Outputs(transforms.DataTransformFn):
     """Outputs for the Go1 policy."""
+    output_dim: int = 22
+
     def __call__(self, data: dict) -> dict:
-        return {"actions": np.asarray(data["actions"][:, :22])}
+        return {"actions": np.asarray(data["actions"][:, :self.output_dim])}
 
 
 @dataclasses.dataclass(frozen=True)

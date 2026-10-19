@@ -48,6 +48,13 @@ def initialize_checkpoint_dir(
             max_to_keep=None,
             keep_period=keep_period,
             create=False,
+            # Async checkpointing deadlocked on this box: at step 2000 every
+            # one of the process's 191 threads sat in futex_wait_queue_me with
+            # the GPU at 0% and the tmp dir static at 12G -- the background save
+            # thread and the main thread waiting on each other, with the 7200s
+            # barrier still an hour away. Saving synchronously costs ~10 min of
+            # wall clock per checkpoint but cannot deadlock.
+            enable_async_checkpointing=False,
             async_options=ocp.AsyncOptions(timeout_secs=7200),
         ),
     )

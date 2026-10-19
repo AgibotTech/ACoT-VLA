@@ -31,6 +31,7 @@ class DroidRldsDataset:
         shuffle_buffer_size: int = 250_000,
         num_parallel_reads: int = -1,  # -1 == tf.data.AUTOTUNE -- hack to not import tf at top level
         num_parallel_calls: int = -1,  # -1 == tf.data.AUTOTUNE -- hack to not import tf at top level
+        seed: int = 0,
     ):
         # Import tensorflow here to not make it mandatory in case RLDS data loader is not used.
         import dlimp as dl
@@ -39,6 +40,10 @@ class DroidRldsDataset:
 
         # Configure Tensorflow with *no GPU devices* (to prevent clobber with PyTorch / JAX)
         tf.config.set_visible_devices([], "GPU")
+
+        # Make TF op-level RNG deterministic so the per-trajectory random choices below
+        # (image side selection + instruction shuffle) are reproducible across runs.
+        tf.random.set_seed(seed)
 
         builder = tfds.builder("droid", data_dir=data_dir)
         dataset = dl.DLataset.from_rlds(builder, split="train", shuffle=shuffle, num_parallel_reads=num_parallel_reads)
@@ -70,14 +75,15 @@ class DroidRldsDataset:
             # Randomly samples one of the two exterior images in DROID during training (we only train with one at a time).
             # Note: the "left" refers to the left camera in the stereo pair, we only train on the left camera.
             exterior_img = tf.cond(
-                tf.random.uniform(shape=[]) > 0.5,
+                tf.random.uniform(shape=[], seed=seed) > 0.5,
                 lambda: traj["observation"]["exterior_image_1_left"],
                 lambda: traj["observation"]["exterior_image_2_left"],
             )
             wrist_img = traj["observation"]["wrist_image_left"]
             # Randomly sample one of the three language instructions
             instruction = tf.random.shuffle(
-                [traj["language_instruction"], traj["language_instruction_2"], traj["language_instruction_3"]]
+                [traj["language_instruction"], traj["language_instruction_2"], traj["language_instruction_3"]],
+                seed=seed,
             )[0]
 
             return {
@@ -143,7 +149,7 @@ class DroidRldsDataset:
         dataset = dataset.frame_map(decode_images, num_parallel_calls)
 
         # Shuffle, batch
-        dataset = dataset.shuffle(shuffle_buffer_size)
+        dataset = dataset.shuffle(shuffle_buffer_size, seed=seed)
         dataset = dataset.batch(batch_size)
         # Note =>> Seems to reduce memory usage without affecting speed?
         dataset = dataset.with_ram_budget(1)

@@ -16,6 +16,32 @@ def test_repack_transform():
     assert transform(item) == {"a": {"b": 1}, "d": 2}
 
 
+def test_center_crop_resize_images_drops_sides_without_padding():
+    # 400x640 image whose pixel value is its column index / 640 * 255: after a square center
+    # crop only columns 120..519 survive, and no black letterbox rows are added.
+    cols = (np.arange(640) / 640 * 255).astype(np.uint8)
+    image = np.broadcast_to(cols[None, :, None], (400, 640, 3)).copy()
+    item = {"image": {"top_head": image}}
+
+    out = _transforms.CenterCropResizeImages(224, 224)(item)["image"]["top_head"]
+
+    assert out.shape == (224, 224, 3)
+    assert out.min() >= int(115 / 640 * 255)
+    assert out.max() <= int(525 / 640 * 255)
+    assert np.all(out[0] == out[-1])  # top and bottom rows are image, not padding
+
+
+def test_center_crop_resize_images_tall_and_already_square():
+    tall = np.zeros((1056, 800, 3), dtype=np.uint8)
+    square = np.full((224, 224, 3), 7, dtype=np.uint8)
+    item = {"image": {"tall": tall, "square": square}}
+
+    out = _transforms.CenterCropResizeImages(224, 224)(item)["image"]
+
+    assert out["tall"].shape == (224, 224, 3)
+    assert np.array_equal(out["square"], square)
+
+
 def test_delta_actions():
     item = {"state": np.array([1, 2, 3]), "actions": np.array([[3, 4, 5], [5, 6, 7]])}
 

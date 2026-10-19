@@ -12,6 +12,7 @@ import openpi.transforms as transforms
 
 from openpi.policies.agilex_fk import batch_qpos_to_eef_pos
 
+
 @dataclasses.dataclass(frozen=True)
 class AgilexInputs(transforms.DataTransformFn):
     """Inputs for the Agilex policy.
@@ -76,9 +77,6 @@ class AgilexInputs(transforms.DataTransformFn):
         # Create image mask based on available cameras
         image_mask = {self.rename_map[camera]: np.True_ for camera in self.EXPECTED_CAMERAS}
 
-        # filter unnormal state / action value, set to 0
-        state = np.where(state > np.pi, 0, state)
-        state = np.where(state < -np.pi, 0, state)
 
         if self.convert_to_eef_position:
             state[..., :14] = batch_qpos_to_eef_pos(state[..., :14])
@@ -94,14 +92,12 @@ class AgilexInputs(transforms.DataTransformFn):
         # Add actions if present
         if "actions" in data:
             actions = transforms.pad_to_dim(data["actions"], self.action_dim)
-            actions = np.where(actions > np.pi, 0, actions)
-            actions = np.where(actions < -np.pi, 0, actions)
             if mask_padding:
                 # Create action mask for padding
                 action_mask = np.ones_like(actions, dtype=bool)
                 action_mask[:, self.action_dim:] = False
                 inputs["action_mask"] = action_mask
-            
+
             if self.convert_to_eef_position:
                 actions[..., :14] = batch_qpos_to_eef_pos(actions[..., :14])
             inputs["actions"] = actions.squeeze()
@@ -184,9 +180,6 @@ class AgilexACOTInputs(transforms.DataTransformFn):
         # Create image mask based on available cameras
         image_mask = {self.rename_map[camera]: np.True_ for camera in self.EXPECTED_CAMERAS}
 
-        # filter unnormal state / action value, set to 0
-        state = np.where(state > np.pi, 0, state)
-        state = np.where(state < -np.pi, 0, state)
 
         if self.convert_to_eef_position:
             state[..., :14] = batch_qpos_to_eef_pos(state[..., :14])
@@ -214,9 +207,7 @@ class AgilexACOTInputs(transforms.DataTransformFn):
         for key in ['coarse_actions', 'actions']:
             if key in data:
                 actions = transforms.pad_to_dim(data[key], self.action_dim)
-                actions = np.where(actions > np.pi, 0, actions)
-                actions = np.where(actions < -np.pi, 0, actions)
-                
+
                 if self.convert_to_eef_position:
                     actions[..., :14] = batch_qpos_to_eef_pos(actions[..., :14])
                 inputs[key] = actions.squeeze()
@@ -235,3 +226,19 @@ class AgilexACOTOutputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         keys = ["coarse_actions", "actions"]
         return {key: np.asarray(data[key][:, :14]) for key in keys if key in data}
+
+
+@dataclasses.dataclass(frozen=True)
+class AgilexInterleaveToGroup(transforms.DataTransformFn):
+    """Dataset is ALOHA-interleaved [Larm6,Lgrip,Rarm6,Rgrip]; reorder state+action
+    to grouped [Larm6,Rarm6,Lgrip,Rgrip] to match arx + sim serving. Train-only
+    (lives in repack_transforms, which is empty at inference)."""
+
+    PERM: ClassVar[tuple[int, ...]] = (0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 6, 13)
+
+    def __call__(self, data: dict) -> dict:
+        perm = list(self.PERM)
+        for key in ("state", "actions"):
+            if key in data:
+                data[key] = np.asarray(data[key])[..., perm]
+        return data

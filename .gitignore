@@ -170,3 +170,5 @@ cython_debug/
 logs/
 *exps*
 .vscode/
+.DS_Store
+docs/STATE.md

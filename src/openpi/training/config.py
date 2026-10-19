@@ -116,6 +116,13 @@ class ModelTransformFactory(GroupFactory):
 
     # If provided, will determine the default prompt that be used by the model.
     default_prompt: str | None = None
+    # True: center-crop images to square, then resize to 224 (no black letterbox bars).
+    center_crop_images: bool = False
+
+    def _resize_images(self) -> _transforms.DataTransformFn:
+        if self.center_crop_images:
+            return _transforms.CenterCropResizeImages(224, 224)
+        return _transforms.ResizeImages(224, 224)
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
@@ -123,7 +130,7 @@ class ModelTransformFactory(GroupFactory):
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
+                        self._resize_images(),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                         ),
@@ -135,7 +142,7 @@ class ModelTransformFactory(GroupFactory):
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
+                        self._resize_images(),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
@@ -148,7 +155,7 @@ class ModelTransformFactory(GroupFactory):
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
+                        self._resize_images(),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                         ),
@@ -160,7 +167,7 @@ class ModelTransformFactory(GroupFactory):
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
+                        self._resize_images(),
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
@@ -172,7 +179,7 @@ class ModelTransformFactory(GroupFactory):
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
-                        _transforms.ResizeImages(224, 224),
+                        self._resize_images(),
                         _transforms.TokenizeFASTInputs(
                             _tokenizer.FASTTokenizer(model_config.max_token_len),
                         ),
@@ -196,6 +203,9 @@ class DataConfigFactory(abc.ABC):
     # Base config that will be updated by the factory.
     base_config: tyro.conf.Suppress[DataConfig | None] = None
 
+    state_mask = None
+    action_mask = None
+
     @abc.abstractmethod
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         """Create a data config."""
@@ -203,13 +213,60 @@ class DataConfigFactory(abc.ABC):
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
         asset_id = self.assets.asset_id or repo_id
+        norm_stats_path = getattr(self, 'norm_stats_path', None)
+        if isinstance(norm_stats_path, str):
+            if os.path.exists(norm_stats_path):
+                norm_stats = self._load_norm_stats_from_json(norm_stats_path)
+            else:
+                logging.warning("norm_stats_path=%s does not exist, falling back to assets.", norm_stats_path)
+                norm_stats = self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id)
+        else:
+            norm_stats = self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id)
         return dataclasses.replace(
             self.base_config or DataConfig(),
             repo_id=repo_id,
             asset_id=asset_id,
-            norm_stats=self._load_norm_stats(epath.Path(self.assets.assets_dir or assets_dirs), asset_id),
-            use_quantile_norm=False,
+            norm_stats=norm_stats,
+            use_quantile_norm=model_config.model_type != ModelType.PI0,
         )
+
+    def _aggregate_norm_stats(
+        self, all_norm_stats: list[dict[str, _transforms.NormStats]]
+    ) -> dict[str, _transforms.NormStats]:
+        from openpi.shared.normalize import NormStats
+
+        agg = {}
+        for key in all_norm_stats[0].keys():
+            agg[key] = NormStats(
+                mean=np.mean([ns[key].mean for ns in all_norm_stats], axis=0),
+                std=np.mean([ns[key].std for ns in all_norm_stats], axis=0),
+                q01=np.mean([ns[key].q01 for ns in all_norm_stats], axis=0),
+                q99=np.mean([ns[key].q99 for ns in all_norm_stats], axis=0),
+            )
+        return agg
+
+    def _apply_norm_stats_mask(self, norm_stats: dict[str, _transforms.NormStats]) -> None:
+        if self.state_mask is not None and "state" in norm_stats:
+            state_mask = np.asarray(self.state_mask)
+            state_len = norm_stats["state"].std.shape[0]
+            dims = min(state_mask.shape[-1], state_len)
+            if dims > 0:
+                m = state_mask[:dims]
+                norm_stats["state"].std[m] = 1e6
+                norm_stats["state"].mean[m] = 0
+                norm_stats["state"].q01[m] = 0
+                norm_stats["state"].q99[m] = 0
+
+        if self.action_mask is not None and "actions" in norm_stats:
+            action_mask = np.asarray(self.action_mask)
+            action_len = norm_stats["actions"].std.shape[0]
+            dims = min(action_mask.shape[-1], action_len)
+            if dims > 0:
+                m = action_mask[:dims]
+                norm_stats["actions"].std[m] = 1e6
+                norm_stats["actions"].mean[m] = 0
+                norm_stats["actions"].q01[m] = 0
+                norm_stats["actions"].q99[m] = 0
 
     def _load_norm_stats(self, assets_dir: epath.Path, asset_id: str | None) -> dict[str, _transforms.NormStats] | None:
         if asset_id is None:
@@ -218,35 +275,41 @@ class DataConfigFactory(abc.ABC):
             if not isinstance(asset_id, list):
                 asset_id = [asset_id]
 
-            # mean of those norm stats:
             all_norm_stats = []
-            # asset_id = asset_id[0] #! use the norm stats from the first episode
             for a_id in asset_id:
                 data_assets_dir = str(assets_dir / a_id)
                 norm_stats = _normalize.load(_download.maybe_download(data_assets_dir))
                 logging.info(f"Loaded norm stats from {data_assets_dir}")
                 all_norm_stats.append(norm_stats)
-            
-            agg = {}
-            
-            for key in all_norm_stats[0].keys():
-                from openpi.shared.normalize import NormStats
-                agg[key] = NormStats(
-                    mean = np.mean([norm_stats[key].mean for norm_stats in all_norm_stats], axis=0), 
-                    std = np.mean([norm_stats[key].std for norm_stats in all_norm_stats], axis=0),
-                    q01 = np.mean([norm_stats[key].q01 for norm_stats in all_norm_stats], axis=0),
-                    q99 = np.mean([norm_stats[key].q99 for norm_stats in all_norm_stats], axis=0),
-                )
 
-
-            norm_stats = agg
-
-            # data_assets_dir = str(assets_dir / asset_id)
-            # norm_stats = _normalize.load(_download.maybe_download(data_assets_dir))
-            # logging.info(f"Loaded norm stats from {data_assets_dir}")
+            norm_stats = self._aggregate_norm_stats(all_norm_stats)
+            self._apply_norm_stats_mask(norm_stats)
             return norm_stats
         except FileNotFoundError:
             logging.info(f"Norm stats not found in {data_assets_dir}, skipping.")
+        return None
+
+    def _load_norm_stats_from_json(self, json_path: str) -> dict[str, _transforms.NormStats] | None:
+        if json_path is None:
+            return None
+        try:
+            from openpi.shared.normalize import deserialize_json
+
+            if not isinstance(json_path, list):
+                json_path = [json_path]
+
+            all_norm_stats = []
+            for j_path in json_path:
+                json_file_path = pathlib.Path(j_path)
+                norm_stats = deserialize_json(json_file_path.read_text())
+                logging.info(f"Loaded norm stats from {json_file_path}")
+                all_norm_stats.append(norm_stats)
+
+            norm_stats = self._aggregate_norm_stats(all_norm_stats)
+            self._apply_norm_stats_mask(norm_stats)
+            return norm_stats
+        except FileNotFoundError:
+            logging.info(f"Norm stats not found in {json_file_path}, skipping.")
         return None
 
 
@@ -545,15 +608,31 @@ class LerobotACOTGo1DataConfig(DataConfigFactory):
     delta_action_mask: Sequence[int] = dataclasses.field(
         default_factory=lambda: _transforms.make_bool_mask(14, -18)
     )
+    state_keys: Sequence[str] = ("state/joint/position", "state/left_effector/position", "state/right_effector/position")
+    action_keys: Sequence[str] = ("action/joint/position", "action/left_effector/position", "action/right_effector/position")
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        # Resolve dataset field indices from info.json field_descriptions so any layout
+        # (legacy 190, v21 183, ...) is remapped dynamically instead of hardcoded.
+        repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
+        state_indices = None
+        action_indices = None
+        if repo_id is not None:
+            try:
+                state_indices = tuple(go1_policy.load_field_indices(repo_id, "observation.state", tuple(self.state_keys)))
+                action_indices = tuple(go1_policy.load_field_indices(repo_id, "action", tuple(self.action_keys)))
+            except (FileNotFoundError, KeyError) as e:
+                logging.warning("Could not load field indices from info.json, falling back to no remapping: %s", e)
+
         # Create data transforms for inputs and outputs
         data_transforms = _transforms.Group(
             inputs=[go1_policy.Go1ACOTInputs(
                 action_dim=model_config.action_dim,
                 state_mask = self.state_mask,
                 action_mask = self.action_mask,
+                state_indices=state_indices,
+                action_indices=action_indices,
                 acot_action_generation=((model_config.coarse_action_horizon, model_config.action_horizon), self.joint_action_shifts))
             ],
             outputs=[go1_policy.Go1ACOTOutputs()],
@@ -874,8 +953,10 @@ class LerobotAgilexDataConfig(DataConfigFactory):
                         },
                         "state": "observation.state",
                         "actions": "action",
+                        "prompt": "prompt",
                     }
-                )
+                ),
+                agilex_policy.AgilexInterleaveToGroup(),
             ]
         )
     )
@@ -906,8 +987,7 @@ class LerobotAgilexDataConfig(DataConfigFactory):
 
         # Apply delta action transform if enabled
         if self.use_delta_joint_actions:
-            # Assuming first 13 dimensions are joints and last dimension is gripper
-            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)  # index 6, 13 is gripper
+            delta_action_mask = _transforms.make_bool_mask(12, -2)  # grouped: arm 0-11 delta, gripper 12,13 absolute
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
@@ -952,7 +1032,8 @@ class LerobotACOTAgilexDataConfig(DataConfigFactory):
                         "state": "observation.state",
                         "actions": "action",
                     }
-                )
+                ),
+                agilex_policy.AgilexInterleaveToGroup(),
             ]
         )
     )
@@ -978,7 +1059,7 @@ class LerobotACOTAgilexDataConfig(DataConfigFactory):
             outputs=[agilex_policy.AgilexACOTOutputs()],
         )
 
-        delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)  # index 6, 13 is gripper
+        delta_action_mask = _transforms.make_bool_mask(12, -2)  # grouped: arm 0-11 delta, gripper 12,13 absolute
         data_transforms = data_transforms.push(
             inputs=[_transforms.ACOTDeltaActions(delta_action_mask, self.extra_delta_transform)],
             outputs=[_transforms.ACOTAbsoluteActions(delta_action_mask, self.extra_delta_transform)],
@@ -1023,6 +1104,7 @@ class LerobotARXDataConfig(DataConfigFactory):
                         },
                         "state": "observation.state",
                         "actions": "action",
+                        "prompt": "prompt",
                     }
                 )
             ]
@@ -1052,7 +1134,7 @@ class LerobotARXDataConfig(DataConfigFactory):
 
         # Apply delta action transform if enabled
         if self.use_delta_joint_actions:
-            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            delta_action_mask = _transforms.make_bool_mask(12, -2)  # grouped: arm 0-11 delta, gripper 12,13 absolute
 
         data_transforms = data_transforms.push(
             inputs=[_transforms.DeltaActions(delta_action_mask)],
@@ -1126,7 +1208,7 @@ class LerobotACOTARXDataConfig(DataConfigFactory):
         )
 
         # Apply delta action transform if enabled
-        delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+        delta_action_mask = _transforms.make_bool_mask(12, -2)  # grouped: arm 0-11 delta, gripper 12,13 absolute
         data_transforms = data_transforms.push(
             inputs=[_transforms.ACOTDeltaActions(delta_action_mask, self.extra_delta_transform)],
             outputs=[_transforms.ACOTAbsoluteActions(delta_action_mask, self.extra_delta_transform)],
@@ -1144,6 +1226,150 @@ class LerobotACOTARXDataConfig(DataConfigFactory):
         )
         object.__setattr__(ret_config, 'joint_action_shifts', self.joint_action_shifts)
         return ret_config
+
+
+@dataclasses.dataclass(frozen=True)
+class LerobotGo1DataConfig(DataConfigFactory):
+    # When True, waist dims 16-19 are left live instead of being zeroed. Only
+    # valid with norm_stats whose q01/q99 for those dims are real -- with the
+    # checkpoint's degenerate q01==q99==0 the quantile transform would map them
+    # to ~1e6 rather than into [-1, 1].
+    unmask_waist: bool = False
+    use_delta_joint_actions: bool = True
+    default_prompt: str | None = None
+    norm_stats_path: str | None = None
+
+    state_keys: Sequence[str] = ("state/joint/position", "state/left_effector/position", "state/right_effector/position")
+    action_keys: Sequence[str] = ("action/joint/position", "action/left_effector/position", "action/right_effector/position")
+
+    # If True, append waist (5 dim) to state/action keys so dims 16..20 carry waist
+    # joint position instead of zero padding. Requires state/waist/position and
+    # action/waist/position fields in the dataset's meta/info.json.
+    include_waist: bool = False
+
+    # If True, images are center-cropped to square then resized to 224 instead of
+    # letterboxed. Applies at training and serving (both use model_transforms).
+    center_crop_images: bool = False
+
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "top_head": "observation.images.top_head",
+                            "hand_left": "observation.images.hand_left",
+                            "hand_right": "observation.images.hand_right",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+    )
+
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    mask_gripper_state: bool = False
+    output_dim: int = 22
+
+    state_mask = np.array(_transforms.make_bool_mask(-16, 16))
+    action_mask = np.array(_transforms.make_bool_mask(-16, 16))
+    # If None, create() picks the default based on include_waist.
+    delta_action_mask: Sequence[bool] | None = None
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repo_id = self.repo_id if self.repo_id is not tyro.MISSING else None
+
+        state_keys = tuple(self.state_keys)
+        action_keys = tuple(self.action_keys)
+        if self.include_waist:
+            state_keys = state_keys + ("state/waist/position",)
+            action_keys = action_keys + ("action/waist/position",)
+
+        state_indices = None
+        action_indices = None
+        if repo_id is not None:
+            try:
+                state_indices = tuple(go1_policy.load_field_indices(repo_id, "observation.state", state_keys))
+                action_indices = tuple(go1_policy.load_field_indices(repo_id, "action", action_keys))
+            except (FileNotFoundError, KeyError) as e:
+                logging.warning("Could not load field indices from info.json, falling back to no remapping: %s", e)
+
+        # include_waist and mask_gripper_state are independent controls:
+        #   mask_gripper_state -> zero gripper proprioception (state dims 14,15)
+        #   include_waist      -> keep only waist[4] (dim 20), zero waist[0..3] (dims 16-19)
+        # Grippers in the action are always supervised; mask_gripper_state only affects state.
+        action_dim = model_config.action_dim
+        if self.include_waist:
+            assert action_dim >= 21, f"action_dim ({action_dim}) must be >= 21 for include_waist=True"
+        state_mask = np.zeros(action_dim, dtype=bool)
+        action_mask = np.zeros(action_dim, dtype=bool)
+        if self.mask_gripper_state:
+            state_mask[14:16] = True
+        if self.include_waist:
+            if not self.unmask_waist:
+                state_mask[16:20] = True   # waist[0..3] unused; keep waist[4] (dim 20)
+                action_mask[16:20] = True
+            state_mask[21:] = True
+            action_mask[21:] = True
+        else:
+            state_mask[16:] = True     # no waist: drop everything past the grippers
+            action_mask[16:] = True
+
+        # Keep the masks used by _apply_norm_stats_mask (read from self) in sync with
+        # the runtime mask used by Go1Inputs above. Without this, include_waist=True
+        # leaves dim 20 (waist[4]) live at runtime but zeroed in norm_stats, so quantile
+        # normalize divides by ~0 and produces values in the hundreds — blowing up loss.
+        object.__setattr__(self, 'state_mask', state_mask)
+        object.__setattr__(self, 'action_mask', action_mask)
+
+        data_transforms = _transforms.Group(
+            inputs=[
+                go1_policy.Go1Inputs(
+                    action_dim=model_config.action_dim,
+                    model_type=model_config.model_type,
+                    state_mask=state_mask,
+                    action_mask=action_mask,
+                    state_indices=state_indices,
+                    action_indices=action_indices,
+                )
+            ],
+            outputs=[go1_policy.Go1Outputs(output_dim=self.output_dim)],
+        )
+
+        if self.use_delta_joint_actions:
+            if self.delta_action_mask is not None:
+                delta_action_mask = self.delta_action_mask
+            elif self.include_waist:
+                # Match compare/openpi LerobotGo2DataConfig exactly:
+                # delta on 14 joints + everything past the 2 grippers (incl. waist).
+                # state_mask zeroes waist[0..3] so their delta is a no-op; only
+                # waist[4] (dim 20) actually moves through delta space, which is
+                # what the compare-repo checkpoint was trained on.
+                delta_action_mask = _transforms.make_bool_mask(14, -2, 16)
+            else:
+                delta_action_mask = _transforms.make_bool_mask(14, -2, 6)
+
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(
+            default_prompt=self.default_prompt, center_crop_images=self.center_crop_images
+        )(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1936,7 +2162,1369 @@ _CONFIGS = [
         freeze_filter = acot_vla.ACOTConfig(paligemma_variant="gemma_2b_lora").get_freeze_filter(
             freeze_vision = False, freeze_llm = True, freeze_llm_embedder=True, freeze_dual_ae=[False, False]
         )
-    )
+    ),
+    # genie sim instruction and robust (pi05)
+    TrainConfig(
+        name="pi05_genie_sim_instruction_and_robust_20260526",
+        model=pi0.Pi0Config(pi05=True, action_horizon=50, discrete_state_input=True),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_block_color_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_block_number_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_block_shape_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_block_size_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_common_sense_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_object_type_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_specific_object_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/straighten_object_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_follow_logic_(or)_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_billards_color_500",
+            ],
+            assets=AssetsConfig(
+                assets_dir=None,
+                asset_id="/mnt/public/jincheng/train/lerobot/pi05_genie_sim_instruction_and_robust_20260526",
+            ),
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            output_dim=16,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        resume=True,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/public/zhonglinqing/pkgs/pi05_model/params"),
+        num_workers=24 if not os.getenv("DEBUG_MODE", default=False) == "true" else 2,
+        batch_size=256 if not os.getenv("DEBUG_MODE", default=False) == "true" else 2,
+        num_train_steps=50_000,
+        save_interval=5000 if not os.getenv("DEBUG_MODE", default=False) == "true" else 1000,
+    ),
+    # genie sim instruction and robust (pi0)
+    TrainConfig(
+        name="pi0_genie_sim_instruction_and_robust_20260526",
+        model=pi0.Pi0Config(pi05=False, action_horizon=50),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_block_color_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_block_number_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_block_shape_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_block_size_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_common_sense_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_object_type_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_specific_object_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/straighten_object_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_follow_logic_(or)_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_billards_color_500",
+            ],
+            assets=AssetsConfig(
+                assets_dir=None,
+                asset_id="/mnt/public/jincheng/train/lerobot/pi05_genie_sim_instruction_and_robust_20260526",
+            ),
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            output_dim=16,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        resume=True,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/public/public_datasets/VLA_weigths/PI0/params"),
+        num_workers=24 if not os.getenv("DEBUG_MODE", default=False) == "true" else 2,
+        batch_size=256 if not os.getenv("DEBUG_MODE", default=False) == "true" else 2,
+        num_train_steps=50_000,
+        save_interval=5000 if not os.getenv("DEBUG_MODE", default=False) == "true" else 1000,
+    ),
+    # genie sim sim2real tasks(pi0.5)
+    TrainConfig(
+        name="pi05_genie_sim_s2r_20260615",
+        model=pi0.Pi0Config(pi05=True, action_horizon=50, discrete_state_input=True),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/mnt/public/linyiren/data/geniesim_data/a2d_probe/task_4871",
+                "/mnt/public/linyiren/data/geniesim_data/a2d_probe/task_4873",
+                "/mnt/public/linyiren/data/geniesim_data/a2d_probe/task_4939",
+                "/mnt/public/linyiren/data/geniesim_data/a2d_probe/task_5125",
+                "/mnt/public/linyiren/data/geniesim_data/a2d_probe/task_6944",
+                "/mnt/public/linyiren/data/geniesim_data/a2d_probe/task_7070",
+                "/mnt/public/linyiren/data/geniesim_data/a2d_probe/task_7332",
+                "/mnt/public/linyiren/data/geniesim_data/a2d_probe/task_7453",
+            ],
+            assets=AssetsConfig(
+                assets_dir=None,
+                asset_id="/mnt/public/jincheng/train/lerobot/pi05_genie_sim_s2r_20260615",
+            ),
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            output_dim=16,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        resume=True,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/public/zhonglinqing/pkgs/pi05_model/params"),
+        num_workers=24 if not os.getenv("DEBUG_MODE", default=False) == "true" else 2,
+        batch_size=256 if not os.getenv("DEBUG_MODE", default=False) == "true" else 2,
+        num_train_steps=40_000,
+        save_interval=10000 if not os.getenv("DEBUG_MODE", default=False) == "true" else 1000,
+    ),
+    # genie sim spatial tasks (pi0.5)
+    TrainConfig(
+        name="pi05_genie_sim_spatial_20260528",
+        model=pi0.Pi0Config(pi05=True, action_horizon=50, discrete_state_input=True),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/mnt/public/linyiren/data/geniesim_data/spatial/v21/pick_object_relative_position_absolute",
+                "/mnt/public/linyiren/data/geniesim_data/spatial/v21/pick_object_relative_position_relative",
+                "/mnt/public/linyiren/data/geniesim_data/spatial/v21/place_beverage_to_anothers_position",
+                "/mnt/public/linyiren/data/geniesim_data/spatial/v21/place_object_relative_position",
+                "/mnt/public/linyiren/data/geniesim_data/spatial/v21/sort_cubes_by_size",
+                "/mnt/public/linyiren/data/geniesim_data/spatial/v21/sort_number_from_small_to_big",
+                "/mnt/public/linyiren/data/geniesim_data/spatial/v21/stack_bowls",
+                "/mnt/public/linyiren/data/geniesim_data/spatial/v21/stack_three_building_blocks"
+            ],
+            assets=AssetsConfig(
+                assets_dir=None,
+                asset_id="/mnt/public/jincheng/train/lerobot/pi05_genie_sim_spatial_20260528",
+            ),
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            output_dim=16,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        resume=True,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/public/zhonglinqing/pkgs/pi05_model/params"),
+        num_workers=24 if not os.getenv("DEBUG_MODE", default=False) == "true" else 2,
+        batch_size=256 if not os.getenv("DEBUG_MODE", default=False) == "true" else 2,
+        num_train_steps=50_000,
+        save_interval=10000 if not os.getenv("DEBUG_MODE", default=False) == "true" else 1000,
+    ),
+    # genie sim spatial tasks (pi0, reuse pi05 spatial 20260528 dataset)
+    TrainConfig(
+        name="pi0_genie_sim_spatial_20260518",
+        model=pi0.Pi0Config(pi05=False, action_horizon=50),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/mnt/public/linyiren/data/geniesim_data/spatial/v21/pick_object_relative_position_absolute",
+                "/mnt/public/linyiren/data/geniesim_data/spatial/v21/pick_object_relative_position_relative",
+                "/mnt/public/linyiren/data/geniesim_data/spatial/v21/place_beverage_to_anothers_position",
+                "/mnt/public/linyiren/data/geniesim_data/spatial/v21/place_object_relative_position",
+                "/mnt/public/linyiren/data/geniesim_data/spatial/v21/sort_cubes_by_size",
+                "/mnt/public/linyiren/data/geniesim_data/spatial/v21/sort_number_from_small_to_big",
+                "/mnt/public/linyiren/data/geniesim_data/spatial/v21/stack_bowls",
+                "/mnt/public/linyiren/data/geniesim_data/spatial/v21/stack_three_building_blocks"
+            ],
+            assets=AssetsConfig(
+                assets_dir=None,
+                asset_id="/mnt/public/jincheng/train/lerobot/pi05_genie_sim_spatial_20260528",
+            ),
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            output_dim=16,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        resume=True,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/public/public_datasets/VLA_weigths/PI0/params"),
+        num_workers=24 if not os.getenv("DEBUG_MODE", default=False) == "true" else 2,
+        batch_size=256 if not os.getenv("DEBUG_MODE", default=False) == "true" else 2,
+        num_train_steps=40_000,
+        save_interval=5000 if not os.getenv("DEBUG_MODE", default=False) == "true" else 1000,
+    ),
+    TrainConfig(
+        name="pi05_demo_stack_blocks",
+        model=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/mnt/public/linyiren/data/geniesim_data/complex_task/simple_stack_building_blocks_by_demo",
+                "/mnt/public/linyiren/data/geniesim_data/complex_task/stack_symmetric_tower_by_demo"
+            ],
+            assets=AssetsConfig(
+                assets_dir=None,
+                asset_id="/mnt/public/jincheng/train/lerobot/pi05_demo_stack_blocks",
+            ),
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            include_waist=False,
+            output_dim=16,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/public/zhonglinqing/pkgs/pi05_model/params"),
+        num_workers=24 if not os.getenv("DEBUG_MODE", default=False) == "true" else 2,
+        batch_size=256 if not os.getenv("DEBUG_MODE", default=False) == "true" else 2,
+        num_train_steps=50_000,
+        resume=True,
+        save_interval=10000 if not os.getenv("DEBUG_MODE", default=False) == "true" else 1000,
+    ),
+    TrainConfig(
+        name="pi05_genie_sim_manip_20260613",
+        model=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/mnt/public/linyiren/data/geniesim_data/manipulation/v21_lite/clean_the_desktop",
+                "/mnt/public/linyiren/data/geniesim_data/manipulation/v21_lite/hold_pot",
+                "/mnt/public/linyiren/data/geniesim_data/manipulation/v21_lite/open_door",
+                "/mnt/public/linyiren/data/geniesim_data/manipulation/v21_lite/place_block_into_box",
+                "/mnt/public/linyiren/data/geniesim_data/manipulation/v21_lite/pour_workpiece",
+                "/mnt/public/linyiren/data/geniesim_data/manipulation/v21_lite/scoop_popcorn",
+                "/mnt/public/linyiren/data/geniesim_data/manipulation/v21_lite/sorting_packages",
+                "/mnt/public/linyiren/data/geniesim_data/manipulation/v21_lite/stock_and_straighten_shelf",
+                "/mnt/public/linyiren/data/geniesim_data/manipulation/v21_lite/take_wrong_item_shelf"
+            ],
+            assets=AssetsConfig(
+                assets_dir=None,
+                asset_id="/mnt/public/jincheng/train/lerobot/pi05_genie_sim_manip_20260608_v30",
+            ),
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            include_waist=True,
+            mask_gripper_state=True,
+            output_dim=21,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/public/zhonglinqing/pkgs/pi05_model/params"),
+        num_workers=24 if not os.getenv("DEBUG_MODE", default=False) == "true" else 2,
+        batch_size=256 if not os.getenv("DEBUG_MODE", default=False) == "true" else 2,
+        num_train_steps=50_000,
+        resume=True,
+        save_interval=5000 if not os.getenv("DEBUG_MODE", default=False) == "true" else 1000,
+    ),
+    # G2 omnipicker fine-tune of the manipulation_pi05 checkpoint (local).
+    # Differs from pi05_genie_sim_manip_20260613 only in: local repo_id paths,
+    # weight_loader pointing at the downloaded manip checkpoint rather than the
+    # pi05 base, and single-GPU batch/worker counts.
+    # !!! DEPRECATED (2026-09-24) -- OLD, DO NOT USE FOR NEW WORK !!!
+    # Trained on lerobot_v21, whose observation.state came from
+    # /hal/joint_state.position: HALF the true angle on arm joints 1-2 (L1, L2,
+    # R1, R2). Checkpoints from this config learned that bug and misbehave on
+    # the real G2 and in sim. Kept only for reference. Use pi05_g2_motor_* .
+    TrainConfig(
+        name="pi05_g2_smoketest",
+        model=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220),
+        data=LerobotGo1DataConfig(
+            repo_id=["/home/datamentors/g2sim/data/lerobot_v21/folding_towels"],
+            norm_stats_path="/home/datamentors/g2sim/ckpt/checkpoints/manipulation_pi05/assets/norm_stats.json",
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            include_waist=True,
+            mask_gripper_state=True,
+            output_dim=21,
+            # prompt_from_hl_instruction reads info["instruction_segments"], a
+            # Genie Sim field marking sub-task boundaries inside an episode.
+            # Real G2 recordings carry one instruction for the whole episode and
+            # have no such field, so take the prompt from the LeRobot task
+            # instead (PromptFromLeRobotTask, keyed on task_index).
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100, peak_lr=1e-5, decay_steps=10_000, decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/datamentors/g2sim/ckpt/checkpoints/manipulation_pi05/params"
+        ),
+        num_workers=4,
+        batch_size=16,
+        num_train_steps=30,
+        resume=False,
+        save_interval=1000,
+    ),
+    # Run A: action-expert-only fine-tune of manipulation_pi05.
+    #
+    # Identical to pi05_g2_manip_finetune_local except that the VLM is frozen:
+    # get_freeze_filter(freeze_vision=True, freeze_llm=True) freezes ".*img.*"
+    # (SigLIP) and ".*llm(?!.*_1|.*_2).*" (PaliGemma base), leaving only the
+    # action expert ".*llm.*_1.*" trainable.
+    #
+    # Rationale: 30 episodes of a single task is very little data for a full
+    # ~3B-parameter fine-tune. Training only the action expert preserves the
+    # VLM's grounding, cuts optimizer state (so checkpoints are far smaller than
+    # the 12G a full run writes), and is the conventional recipe at this scale.
+    #
+    # Starts from manipulation_pi05, NOT from the full fine-tune's output -- the
+    # point is to freeze the ORIGINAL VLM, not whatever a full run moved it to.
+    # Action-expert-only, WITH waist dims 16-19 unmasked.
+    #
+    # The checkpoint's own norm_stats have q01 == q99 == 0 for dims 16-19 --
+    # Genie Sim never drove those joints. Under quantile normalisation
+    #     (x - q01) / (q99 - q01 + 1e-6) * 2 - 1
+    # that maps a real 0.3 rad waist motion to ~6e5 instead of into [-1, 1],
+    # which is why those dims are masked by default.
+    #
+    # norm_stats_path here points at a spliced copy: dims 16-19 carry real
+    # quantiles computed from all 107,785 G2 frames, every other dim is
+    # byte-identical to the checkpoint's (verified). Arms and grippers are NOT
+    # recomputed -- the model's weights were learned under those statistics and
+    # the conventions already match (gripper range -0.785..0 in both).
+    #
+    # delta_action_mask keeps dim 20 in delta space as before but no longer
+    # zeroes 16-19, so the four body joints carrying the real torso motion
+    # (w3 is the largest span in this dataset) become trainable.
+    # !!! DEPRECATED (2026-09-24) -- OLD, DO NOT USE FOR NEW WORK !!!
+    # Trained on lerobot_v21, whose observation.state came from
+    # /hal/joint_state.position: HALF the true angle on arm joints 1-2 (L1, L2,
+    # R1, R2). Checkpoints from this config learned that bug and misbehave on
+    # the real G2 and in sim. Kept only for reference. Use pi05_g2_motor_* .
+    TrainConfig(
+        name="pi05_g2_waist_unmasked",
+        model=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220),
+        freeze_filter=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220).get_freeze_filter(
+            freeze_vision=True, freeze_llm=True
+        ),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/home/datamentors/g2sim/data/lerobot_v21/folding_towels",
+                "/home/datamentors/g2sim/data/lerobot_v21/folding_towels_s002",
+                "/home/datamentors/g2sim/data/lerobot_v21/folding_towels_s003",
+            ],
+            norm_stats_path="/home/datamentors/g2sim/assets_waist/pi05_g2_waist/norm_stats.json",
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            include_waist=True,
+            mask_gripper_state=True,
+            output_dim=21,
+            # Do not zero dims 16-19: they now have real quantiles.
+            unmask_waist=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=1e-5, decay_steps=100_000, decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/datamentors/g2sim/ckpt/checkpoints/manipulation_pi05/params"
+        ),
+        num_workers=8 if os.getenv("DEBUG_MODE") != "true" else 2,
+        batch_size=16 if os.getenv("DEBUG_MODE") != "true" else 2,
+        num_train_steps=20_000,
+        log_interval=20,
+        resume=True,
+        save_interval=500 if os.getenv("DEBUG_MODE") != "true" else 100,
+    ),
+    # pi05_g2_fixed_masked: corrected ACTIONS norm_stats.
+    #
+    # use_delta_joint_actions=True means the actions block describes
+    # action[t+k] - state[t] -- an offset from the robot's CURRENT pose across
+    # the 30-step chunk, not an absolute joint target. The checkpoint's actions
+    # quantiles come from Genie Sim, whose home pose differs from this G2's, so
+    # they are centred elsewhere: e.g. dim 0 is [-0.298, +0.197] there but
+    # [+0.284, +1.237] here. Unnormalising our model's output with the
+    # checkpoint's centres injected a ~0.58 rad bias into every action, which is
+    # what produced the violent motion on hardware.
+    #
+    # Only the ACTIONS block is recomputed. STATE stays byte-identical to the
+    # checkpoint's: those are absolute joint positions and they already agree.
+    # !!! DEPRECATED (2026-09-24) -- OLD, DO NOT USE FOR NEW WORK !!!
+    # Trained on lerobot_v21, whose observation.state came from
+    # /hal/joint_state.position: HALF the true angle on arm joints 1-2 (L1, L2,
+    # R1, R2). Checkpoints from this config learned that bug and misbehave on
+    # the real G2 and in sim. Kept only for reference. Use pi05_g2_motor_* .
+    TrainConfig(
+        name="pi05_g2_fixed_masked",
+        model=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220),
+        freeze_filter=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220).get_freeze_filter(
+            freeze_vision=True, freeze_llm=True
+        ),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/home/datamentors/g2sim/data/lerobot_v21/folding_towels",
+                "/home/datamentors/g2sim/data/lerobot_v21/folding_towels_s002",
+                "/home/datamentors/g2sim/data/lerobot_v21/folding_towels_s003",
+            ],
+            norm_stats_path="/home/datamentors/g2sim/assets_fixed/pi05_g2_fixed/norm_stats.json",
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            include_waist=True,
+            mask_gripper_state=True,
+            output_dim=21,
+            unmask_waist=False,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=1e-5, decay_steps=100_000, decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/datamentors/g2sim/ckpt/checkpoints/manipulation_pi05/params"
+        ),
+        num_workers=8 if os.getenv("DEBUG_MODE") != "true" else 2,
+        batch_size=16 if os.getenv("DEBUG_MODE") != "true" else 2,
+        num_train_steps=20_000,
+        log_interval=20,
+        resume=True,
+        save_interval=1000 if os.getenv("DEBUG_MODE") != "true" else 100,
+    ),
+    # pi05_g2_fixed_waist: corrected ACTIONS norm_stats.
+    #
+    # use_delta_joint_actions=True means the actions block describes
+    # action[t+k] - state[t] -- an offset from the robot's CURRENT pose across
+    # the 30-step chunk, not an absolute joint target. The checkpoint's actions
+    # quantiles come from Genie Sim, whose home pose differs from this G2's, so
+    # they are centred elsewhere: e.g. dim 0 is [-0.298, +0.197] there but
+    # [+0.284, +1.237] here. Unnormalising our model's output with the
+    # checkpoint's centres injected a ~0.58 rad bias into every action, which is
+    # what produced the violent motion on hardware.
+    #
+    # Only the ACTIONS block is recomputed. STATE stays byte-identical to the
+    # checkpoint's: those are absolute joint positions and they already agree.
+    # !!! DEPRECATED (2026-09-24) -- OLD, DO NOT USE FOR NEW WORK !!!
+    # Trained on lerobot_v21, whose observation.state came from
+    # /hal/joint_state.position: HALF the true angle on arm joints 1-2 (L1, L2,
+    # R1, R2). Checkpoints from this config learned that bug and misbehave on
+    # the real G2 and in sim. Kept only for reference. Use pi05_g2_motor_* .
+    TrainConfig(
+        name="pi05_g2_fixed_waist",
+        model=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220),
+        freeze_filter=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220).get_freeze_filter(
+            freeze_vision=True, freeze_llm=True
+        ),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/home/datamentors/g2sim/data/lerobot_v21/folding_towels",
+                "/home/datamentors/g2sim/data/lerobot_v21/folding_towels_s002",
+                "/home/datamentors/g2sim/data/lerobot_v21/folding_towels_s003",
+            ],
+            norm_stats_path="/home/datamentors/g2sim/assets_fixed/pi05_g2_fixed/norm_stats.json",
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            include_waist=True,
+            mask_gripper_state=True,
+            output_dim=21,
+            unmask_waist=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=1e-5, decay_steps=100_000, decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/datamentors/g2sim/ckpt/checkpoints/manipulation_pi05/params"
+        ),
+        num_workers=8 if os.getenv("DEBUG_MODE") != "true" else 2,
+        batch_size=16 if os.getenv("DEBUG_MODE") != "true" else 2,
+        num_train_steps=20_000,
+        log_interval=20,
+        resume=True,
+        save_interval=1000 if os.getenv("DEBUG_MODE") != "true" else 100,
+    ),
+    # pi05_g2_motor_{masked,waist}: pi05_g2_fixed_{masked,waist} on corrected data.
+    #
+    # lerobot_v21_mp is reconverted from raw with observation.state taken from
+    # /hal/joint_state.motor_position. The earlier datasets used .position, which
+    # reads exactly HALF the true angle on arm joints 1-2 (L1, L2, R1, R2): the
+    # HAL configures motor_encoder_resolution 20 vs encoder_resolution 19 there.
+    # motor_position matches /hal/joint_cmd and the robot's /tf on every joint,
+    # and it is what the G2 bridge feeds at inference. With .position the delta
+    # actions on those joints were ~+/-0.84 rad biased (not a home-pose effect).
+    #
+    # Train split only (lerobot_v21_mp_train, 26 episodes, 94,639 frames). Held
+    # out for validate_actions.py: lerobot_v21_mp_val = folding_towels ep7,
+    # s002 ep8, s003 ep9. s003 ep5 (174-frame aborted recording) is dropped.
+    # Mapping back to source episodes: <dataset>/meta/split_source.json.
+    #
+    # norm_stats: BOTH blocks recomputed from the 26 train episodes, dims 0-20.
+    # State is no longer the checkpoint's Genie Sim quantiles: under those, L5
+    # sat outside [-1, 1] in 93% of frames (R3/R5 ~44%), which pi05's 256-bin
+    # state discretisation cannot represent. Masked dims are zeroed at load.
+    TrainConfig(
+        name="pi05_g2_motor_masked",
+        model=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220),
+        freeze_filter=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220).get_freeze_filter(
+            freeze_vision=True, freeze_llm=True
+        ),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_train/folding_towels",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_train/folding_towels_s002",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_train/folding_towels_s003",
+            ],
+            norm_stats_path="/home/datamentors/g2sim/assets_motor_train/pi05_g2_motor_train/norm_stats.json",
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            include_waist=True,
+            mask_gripper_state=True,
+            output_dim=21,
+            unmask_waist=False,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=1e-5, decay_steps=100_000, decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/datamentors/g2sim/ckpt/checkpoints/manipulation_pi05/params"
+        ),
+        num_workers=8 if os.getenv("DEBUG_MODE") != "true" else 2,
+        batch_size=16 if os.getenv("DEBUG_MODE") != "true" else 2,
+        num_train_steps=20_000,
+        log_interval=20,
+        resume=True,
+        save_interval=1000 if os.getenv("DEBUG_MODE") != "true" else 100,
+    ),
+    TrainConfig(
+        name="pi05_g2_motor_waist",
+        model=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220),
+        freeze_filter=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220).get_freeze_filter(
+            freeze_vision=True, freeze_llm=True
+        ),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_train/folding_towels",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_train/folding_towels_s002",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_train/folding_towels_s003",
+            ],
+            norm_stats_path="/home/datamentors/g2sim/assets_motor_train/pi05_g2_motor_train/norm_stats.json",
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            include_waist=True,
+            mask_gripper_state=True,
+            output_dim=21,
+            unmask_waist=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=1e-5, decay_steps=100_000, decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/datamentors/g2sim/ckpt/checkpoints/manipulation_pi05/params"
+        ),
+        num_workers=8 if os.getenv("DEBUG_MODE") != "true" else 2,
+        batch_size=16 if os.getenv("DEBUG_MODE") != "true" else 2,
+        num_train_steps=20_000,
+        log_interval=20,
+        resume=True,
+        save_interval=1000 if os.getenv("DEBUG_MODE") != "true" else 100,
+    ),
+    # pi05_g2_mixed_waist_control ("MixedWaistControl"): continues pi05_g2_motor_waist
+    # (motorwaist_20260925_1012/19999) on the old train split plus two new sessions:
+    #   folding_towels_s004_s005 (episodes 3 and 20 dropped: 27 trailing NaN gripper rows)
+    #   folding_towels_inference_pose
+    # 111 train episodes / 348,579 frames. Held out in lerobot_v21_mp_val: the old 3 plus
+    # s004_s005 eps 10, 32 and inference_pose eps 8, 24, 42 (see meta/split_source.json).
+    # norm_stats recomputed on this train mix (the new sessions move the torso far more:
+    # waist-yaw action range ~+/-0.2 rad vs ~+/-0.004 before). Same prompt in every dataset.
+    TrainConfig(
+        name="pi05_g2_mixed_waist_control",
+        model=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220),
+        freeze_filter=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220).get_freeze_filter(
+            freeze_vision=True, freeze_llm=True
+        ),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_train/folding_towels",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_train/folding_towels_s002",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_train/folding_towels_s003",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_train/folding_towels_s004_s005",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_train/folding_towels_inference_pose",
+            ],
+            norm_stats_path="/home/datamentors/g2sim/assets_mixed_train/pi05_g2_mixed_train/norm_stats.json",
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            include_waist=True,
+            mask_gripper_state=True,
+            output_dim=21,
+            unmask_waist=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=1e-5, decay_steps=100_000, decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/datamentors/g2sim/ACoT-VLA/checkpoints/pi05_g2_motor_waist/motorwaist_20260925_1012/19999/params"
+        ),
+        num_workers=8 if os.getenv("DEBUG_MODE") != "true" else 2,
+        batch_size=16 if os.getenv("DEBUG_MODE") != "true" else 2,
+        num_train_steps=100_000,
+        log_interval=20,
+        resume=True,
+        save_interval=1000 if os.getenv("DEBUG_MODE") != "true" else 100,
+    ),
+    # pi05_g2_mixed_vision_action ("MixedWaistVision"): continues MixedWaistControl/95000
+    # (best val) with the VISION encoder (SigLIP + img/head projector) unfrozen as well as the
+    # action expert; the PaliGemma language model stays frozen. Same LR (1e-5) for all trainable
+    # params. Data = the 5 MixedWaistControl train sets + two new sessions:
+    #   folding_towels_infpose002 (ep 26 dropped: 27 NaN rows; val eps 3, 12, 20, 32)
+    #   folding_towels_infpose003 (val ep 7)
+    # 156 train episodes / 480,775 frames; val = the previous 8 episodes unchanged + those 5.
+    # norm_stats recomputed on this 7-set train mix.
+    TrainConfig(
+        name="pi05_g2_mixed_vision_action",
+        model=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220),
+        freeze_filter=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220).get_freeze_filter(
+            freeze_vision=False, freeze_llm=True
+        ),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_train/folding_towels",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_train/folding_towels_s002",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_train/folding_towels_s003",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_train/folding_towels_s004_s005",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_train/folding_towels_inference_pose",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_train/folding_towels_infpose002",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_train/folding_towels_infpose003",
+            ],
+            norm_stats_path="/home/datamentors/g2sim/assets_mixed2_train/pi05_g2_mixed2_train/norm_stats.json",
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            include_waist=True,
+            mask_gripper_state=True,
+            output_dim=21,
+            unmask_waist=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=1e-5, decay_steps=100_000, decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/datamentors/g2sim/ACoT-VLA/checkpoints/pi05_g2_mixed_waist_control/MixedWaistControl/95000/params"
+        ),
+        num_workers=8 if os.getenv("DEBUG_MODE") != "true" else 2,
+        batch_size=16 if os.getenv("DEBUG_MODE") != "true" else 2,
+        num_train_steps=100_000,
+        log_interval=20,
+        resume=True,
+        save_interval=1000 if os.getenv("DEBUG_MODE") != "true" else 100,
+    ),
+    # pi05_g2_ipw_vision_action ("InfPoseWaistVision"): ONE embodiment only -- inference pose
+    # + headset waist. Trained from the BASE manipulation_pi05 (not a G2 fine-tune).
+    # Vision (SigLIP + img/head) and action expert trainable; PaliGemma LLM frozen; LR 1e-5.
+    # Data (lerobot_v21_mp_ipw_*, fresh 90/10 split, see meta/split_source.json):
+    #   folding_towels_inference_pose  train 45 / val 5 (4, 14, 24, 34, 44)
+    #   folding_towels_infpose002      eps 0-9 only: train 9 / val 1 (5)
+    #   folding_towels_infpose003      train 13 / val 1 (7)
+    #   folding_towels_infpose004      train 37 / val 4 (5, 15, 25, 35)
+    #   folding_towels_infpose005      train 42 / val 5 (4, 14, 24, 33, 42)
+    # 146 train episodes / 404,396 frames; 16 val episodes / 43,723 frames. Stats on this train set.
+    TrainConfig(
+        name="pi05_g2_ipw_vision_action",
+        model=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220),
+        freeze_filter=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220).get_freeze_filter(
+            freeze_vision=False, freeze_llm=True
+        ),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw_train/folding_towels_inference_pose",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw_train/folding_towels_infpose002",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw_train/folding_towels_infpose003",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw_train/folding_towels_infpose004",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw_train/folding_towels_infpose005",
+            ],
+            norm_stats_path="/home/datamentors/g2sim/assets_ipw_train/pi05_g2_ipw_train/norm_stats.json",
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            include_waist=True,
+            mask_gripper_state=True,
+            output_dim=21,
+            unmask_waist=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000, peak_lr=1e-5, decay_steps=100_000, decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/datamentors/g2sim/ckpt/checkpoints/manipulation_pi05/params"
+        ),
+        num_workers=8 if os.getenv("DEBUG_MODE") != "true" else 2,
+        batch_size=16 if os.getenv("DEBUG_MODE") != "true" else 2,
+        num_train_steps=100_000,
+        log_interval=20,
+        resume=True,
+        save_interval=1000 if os.getenv("DEBUG_MODE") != "true" else 100,
+    ),
+    # pi05_g2_ipw_vision_action_wsd: identical to pi05_g2_ipw_vision_action except the LR
+    # schedule is Warmup-Stable-Decay -- 1k warmup, flat 1e-5 (same peak as the cosine config),
+    # then 1-sqrt decay to 1e-6 over the final 10k of 100k steps.
+    TrainConfig(
+        name="pi05_g2_ipw_vision_action_wsd",
+        model=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220),
+        freeze_filter=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220).get_freeze_filter(
+            freeze_vision=False, freeze_llm=True
+        ),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw_train/folding_towels_inference_pose",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw_train/folding_towels_infpose002",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw_train/folding_towels_infpose003",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw_train/folding_towels_infpose004",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw_train/folding_towels_infpose005",
+            ],
+            norm_stats_path="/home/datamentors/g2sim/assets_ipw_train/pi05_g2_ipw_train/norm_stats.json",
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            include_waist=True,
+            mask_gripper_state=True,
+            output_dim=21,
+            unmask_waist=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        lr_schedule=_optimizer.WSDSchedule(
+            warmup_steps=1_000, peak_lr=1e-5, total_steps=100_000, decay_steps=10_000, end_lr=1e-6, decay_type="sqrt",
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/datamentors/g2sim/ckpt/checkpoints/manipulation_pi05/params"
+        ),
+        num_workers=8 if os.getenv("DEBUG_MODE") != "true" else 2,
+        batch_size=16 if os.getenv("DEBUG_MODE") != "true" else 2,
+        num_train_steps=100_000,
+        log_interval=20,
+        resume=True,
+        save_interval=1000 if os.getenv("DEBUG_MODE") != "true" else 100,
+    ),
+    # pi05_g2_ipw_vision_action_wsd_crop: pi05_g2_ipw_vision_action_wsd + square center crop
+    # instead of letterbox (head 640x400 -> central 400x400, hands 1280x1056 -> central
+    # 1056x1056, then 224x224). Checkpoints from this config must be served with it.
+    TrainConfig(
+        name="pi05_g2_ipw_vision_action_wsd_crop",
+        model=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220),
+        freeze_filter=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220).get_freeze_filter(
+            freeze_vision=False, freeze_llm=True
+        ),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw_train/folding_towels_inference_pose",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw_train/folding_towels_infpose002",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw_train/folding_towels_infpose003",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw_train/folding_towels_infpose004",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw_train/folding_towels_infpose005",
+            ],
+            norm_stats_path="/home/datamentors/g2sim/assets_ipw_train/pi05_g2_ipw_train/norm_stats.json",
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            include_waist=True,
+            mask_gripper_state=True,
+            output_dim=21,
+            unmask_waist=True,
+            center_crop_images=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        lr_schedule=_optimizer.WSDSchedule(
+            warmup_steps=1_000, peak_lr=1e-5, total_steps=100_000, decay_steps=10_000, end_lr=1e-6, decay_type="sqrt",
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/datamentors/g2sim/ckpt/checkpoints/manipulation_pi05/params"
+        ),
+        num_workers=8 if os.getenv("DEBUG_MODE") != "true" else 2,
+        batch_size=16 if os.getenv("DEBUG_MODE") != "true" else 2,
+        num_train_steps=100_000,
+        log_interval=20,
+        resume=True,
+        save_interval=1000 if os.getenv("DEBUG_MODE") != "true" else 100,
+    ),
+    # pi05_g2_ipw2_vision_action_wsd_crop: pi05_g2_ipw_vision_action_wsd_crop (fork commits 330cd2a + d0b7bef:
+    # WSD 1e-5 -> 1e-6 over the last 10k + square center crop) on the ipw dataset v2 = the 5 ipw sessions +
+    # folding_towels_infpose_headset_20261001_s01 (train 25 / val 3: eps 4, 14, 24) and _s02 (train 9 / val 1: ep 8)
+    # from s3://ardia-ai-datasets-dev/processed/.../g2a0004-infpose-headset/2026-10-01. 180 train / 20 val eps.
+    # Norm stats recomputed on this 7-set train mix. Base manipulation_pi05 weights.
+    TrainConfig(
+        name="pi05_g2_ipw2_vision_action_wsd_crop",
+        model=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220),
+        freeze_filter=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220).get_freeze_filter(
+            freeze_vision=False, freeze_llm=True
+        ),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw_train/folding_towels_inference_pose",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw_train/folding_towels_infpose002",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw_train/folding_towels_infpose003",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw_train/folding_towels_infpose004",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw_train/folding_towels_infpose005",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw_train/folding_towels_infpose_headset_20261001_s01",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw_train/folding_towels_infpose_headset_20261001_s02",
+            ],
+            norm_stats_path="/home/datamentors/g2sim/assets_ipw2_train/pi05_g2_ipw2_train/norm_stats.json",
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            include_waist=True,
+            mask_gripper_state=True,
+            output_dim=21,
+            unmask_waist=True,
+            center_crop_images=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        lr_schedule=_optimizer.WSDSchedule(
+            warmup_steps=1_000, peak_lr=1e-5, total_steps=100_000, decay_steps=10_000, end_lr=1e-6, decay_type="sqrt",
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/datamentors/g2sim/ckpt/checkpoints/manipulation_pi05/params"
+        ),
+        num_workers=8 if os.getenv("DEBUG_MODE") != "true" else 2,
+        batch_size=16 if os.getenv("DEBUG_MODE") != "true" else 2,
+        num_train_steps=100_000,
+        log_interval=20,
+        resume=True,
+        save_interval=1000 if os.getenv("DEBUG_MODE") != "true" else 100,
+    ),
+    # pi05_g2_ipw3_vision_action_wsd_crop_ft99k: pi05_g2_ipw2_vision_action_wsd_crop (same model, freeze, LR/WSD, crop,
+    # bs, steps) fine-tuned FROM InfPoseWaistVisionWsdCrop/99999 on the ipw3 dataset = ipw2 split unchanged + headset
+    # sessions 20261002_s01/_s02, 20261006_s01, 20261007_s01, 20261008_s01 (val every 10th ep from 4; s01 eps 25-27
+    # dropped: static/no-gripper takes) + 20261008_s02 (train only). 385 train / 44 val eps. Norm stats recomputed on the ipw3 train set. See g2sim/assets_ipw3_train/README.md.
+    TrainConfig(
+        name="pi05_g2_ipw3_vision_action_wsd_crop_ft99k",
+        model=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220),
+        freeze_filter=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220).get_freeze_filter(
+            freeze_vision=False, freeze_llm=True
+        ),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw3_train/folding_towels_inference_pose",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw3_train/folding_towels_infpose002",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw3_train/folding_towels_infpose003",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw3_train/folding_towels_infpose004",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw3_train/folding_towels_infpose005",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw3_train/folding_towels_infpose_headset_20261001_s01",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw3_train/folding_towels_infpose_headset_20261001_s02",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw3_train/folding_towels_infpose_headset_20261002_s01",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw3_train/folding_towels_infpose_headset_20261002_s02",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw3_train/folding_towels_infpose_headset_20261006_s01",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw3_train/folding_towels_infpose_headset_20261007_s01",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw3_train/folding_towels_infpose_headset_20261008_s01",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw3_train/folding_towels_infpose_headset_20261008_s02",
+            ],
+            norm_stats_path="/home/datamentors/g2sim/assets_ipw3_train/pi05_g2_ipw3_train/norm_stats.json",
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            include_waist=True,
+            mask_gripper_state=True,
+            output_dim=21,
+            unmask_waist=True,
+            center_crop_images=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        lr_schedule=_optimizer.WSDSchedule(
+            warmup_steps=1_000, peak_lr=1e-5, total_steps=100_000, decay_steps=10_000, end_lr=1e-6, decay_type="sqrt",
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/datamentors/g2sim/ACoT-VLA/checkpoints/pi05_g2_ipw2_vision_action_wsd_crop/InfPoseWaistVisionWsdCrop/99999/params"
+        ),
+        num_workers=8 if os.getenv("DEBUG_MODE") != "true" else 2,
+        batch_size=16 if os.getenv("DEBUG_MODE") != "true" else 2,
+        num_train_steps=100_000,
+        log_interval=20,
+        resume=True,
+        save_interval=1000 if os.getenv("DEBUG_MODE") != "true" else 100,
+    ),
+    # pi05_g2_ipw4_vision_action_wsd_crop_ft: pi05_g2_ipw3_vision_action_wsd_crop_ft99k (same model, freeze, LR/WSD, crop,
+    # bs, steps) as a NEW run (not resume) FROM InfPoseWaistVisionWsdCropFt99k/99999 on ipw4 = ipw3 split unchanged +
+    # folding_towels_infpose_headset_20261012_s01 (s3 .../2026-10-12/s01, 30 eps: train 27 / val 3: eps 4, 14, 24).
+    # 412 train / 47 val eps. Norm stats recomputed on ipw4 train. See g2sim/assets_ipw4_train/README.md.
+    TrainConfig(
+        name="pi05_g2_ipw4_vision_action_wsd_crop_ft",
+        model=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220),
+        freeze_filter=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220).get_freeze_filter(
+            freeze_vision=False, freeze_llm=True
+        ),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_inference_pose",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_infpose002",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_infpose003",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_infpose004",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_infpose005",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_infpose_headset_20261001_s01",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_infpose_headset_20261001_s02",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_infpose_headset_20261002_s01",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_infpose_headset_20261002_s02",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_infpose_headset_20261006_s01",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_infpose_headset_20261007_s01",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_infpose_headset_20261008_s01",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_infpose_headset_20261008_s02",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_infpose_headset_20261012_s01",
+            ],
+            norm_stats_path="/home/datamentors/g2sim/assets_ipw4_train/pi05_g2_ipw4_train/norm_stats.json",
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            include_waist=True,
+            mask_gripper_state=True,
+            output_dim=21,
+            unmask_waist=True,
+            center_crop_images=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        lr_schedule=_optimizer.WSDSchedule(
+            warmup_steps=1_000, peak_lr=1e-5, total_steps=100_000, decay_steps=10_000, end_lr=1e-6, decay_type="sqrt",
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/datamentors/g2sim/ACoT-VLA/checkpoints/pi05_g2_ipw3_vision_action_wsd_crop_ft99k/InfPoseWaistVisionWsdCropFt99k/99999/params"
+        ),
+        num_workers=8 if os.getenv("DEBUG_MODE") != "true" else 2,
+        batch_size=16 if os.getenv("DEBUG_MODE") != "true" else 2,
+        num_train_steps=100_000,
+        log_interval=20,
+        resume=True,
+        save_interval=1000 if os.getenv("DEBUG_MODE") != "true" else 100,
+    ),
+    # pi05_g2_ipw4_vision_action_wsd_crop_ft3: pi05_g2_ipw4_vision_action_wsd_crop_ft (same ipw4 data + stats, model,
+    # freeze, crop, bs, peak/end LR) as a NEW 50k-step WSD cycle (1k warmup, flat 1e-5, sqrt decay to 1e-6 over the
+    # last 5k) FROM InfPoseWaistVisionWsdCropFt2/98000 (best of Ft2, val mae 0.03054). No new data.
+    TrainConfig(
+        name="pi05_g2_ipw4_vision_action_wsd_crop_ft3",
+        model=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220),
+        freeze_filter=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220).get_freeze_filter(
+            freeze_vision=False, freeze_llm=True
+        ),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_inference_pose",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_infpose002",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_infpose003",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_infpose004",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_infpose005",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_infpose_headset_20261001_s01",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_infpose_headset_20261001_s02",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_infpose_headset_20261002_s01",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_infpose_headset_20261002_s02",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_infpose_headset_20261006_s01",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_infpose_headset_20261007_s01",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_infpose_headset_20261008_s01",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_infpose_headset_20261008_s02",
+                "/home/datamentors/g2sim/data/lerobot_v21_mp_ipw4_train/folding_towels_infpose_headset_20261012_s01",
+            ],
+            norm_stats_path="/home/datamentors/g2sim/assets_ipw4_train/pi05_g2_ipw4_train/norm_stats.json",
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            include_waist=True,
+            mask_gripper_state=True,
+            output_dim=21,
+            unmask_waist=True,
+            center_crop_images=True,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        lr_schedule=_optimizer.WSDSchedule(
+            warmup_steps=1_000, peak_lr=1e-5, total_steps=50_000, decay_steps=5_000, end_lr=1e-6, decay_type="sqrt",
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/datamentors/g2sim/ACoT-VLA/checkpoints/pi05_g2_ipw4_vision_action_wsd_crop_ft/InfPoseWaistVisionWsdCropFt2/98000/params"
+        ),
+        num_workers=8 if os.getenv("DEBUG_MODE") != "true" else 2,
+        batch_size=16 if os.getenv("DEBUG_MODE") != "true" else 2,
+        num_train_steps=50_000,
+        log_interval=20,
+        resume=True,
+        save_interval=1000 if os.getenv("DEBUG_MODE") != "true" else 100,
+    ),
+    # !!! DEPRECATED (2026-09-24) -- OLD, DO NOT USE FOR NEW WORK !!!
+    # Trained on lerobot_v21, whose observation.state came from
+    # /hal/joint_state.position: HALF the true angle on arm joints 1-2 (L1, L2,
+    # R1, R2). Checkpoints from this config learned that bug and misbehave on
+    # the real G2 and in sim. Kept only for reference. Use pi05_g2_motor_* .
+    TrainConfig(
+        name="pi05_g2_actionexpert_only",
+        model=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220),
+        freeze_filter=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220).get_freeze_filter(
+            freeze_vision=True, freeze_llm=True
+        ),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/home/datamentors/g2sim/data/lerobot_v21/folding_towels",
+                "/home/datamentors/g2sim/data/lerobot_v21/folding_towels_s002",
+                "/home/datamentors/g2sim/data/lerobot_v21/folding_towels_s003",
+            ],
+            norm_stats_path="/home/datamentors/g2sim/ckpt/checkpoints/manipulation_pi05/assets/norm_stats.json",
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            include_waist=True,
+            mask_gripper_state=True,
+            output_dim=21,
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-5,
+            decay_steps=100_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/datamentors/g2sim/ckpt/checkpoints/manipulation_pi05/params"
+        ),
+        num_workers=8 if os.getenv("DEBUG_MODE") != "true" else 2,
+        batch_size=16 if os.getenv("DEBUG_MODE") != "true" else 2,
+        num_train_steps=20_000,
+        log_interval=20,
+        resume=True,
+        # 500 rather than 2000: far more checkpoints to pick from, and each one
+        # is much smaller here because only the action expert carries optimizer
+        # state.
+        save_interval=500 if os.getenv("DEBUG_MODE") != "true" else 100,
+    ),
+    # !!! DEPRECATED (2026-09-24) -- OLD, DO NOT USE FOR NEW WORK !!!
+    # Trained on lerobot_v21, whose observation.state came from
+    # /hal/joint_state.position: HALF the true angle on arm joints 1-2 (L1, L2,
+    # R1, R2). Checkpoints from this config learned that bug and misbehave on
+    # the real G2 and in sim. Kept only for reference. Use pi05_g2_motor_* .
+    TrainConfig(
+        name="pi05_g2_manip_finetune_local",
+        model=pi0.Pi0Config(pi05=True, action_horizon=30, max_token_len=220),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/home/datamentors/g2sim/data/lerobot_v21/folding_towels",
+                "/home/datamentors/g2sim/data/lerobot_v21/folding_towels_s002",
+                "/home/datamentors/g2sim/data/lerobot_v21/folding_towels_s003",
+            ],
+            # Reuse the checkpoint's own norm stats verbatim. norm_stats_path
+            # takes the file directly; assets_dir/asset_id would join to
+            # assets/<asset_id>/norm_stats.json, which does not exist here --
+            # the checkpoint ships it at assets/norm_stats.json.
+            norm_stats_path="/home/datamentors/g2sim/ckpt/checkpoints/manipulation_pi05/assets/norm_stats.json",
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            include_waist=True,
+            mask_gripper_state=True,
+            output_dim=21,
+            # prompt_from_hl_instruction reads info["instruction_segments"], a
+            # Genie Sim field marking sub-task boundaries inside an episode.
+            # Real G2 recordings carry one instruction for the whole episode and
+            # have no such field, so take the prompt from the LeRobot task
+            # instead (PromptFromLeRobotTask, keyed on task_index).
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-5,
+            decay_steps=100_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/home/datamentors/g2sim/ckpt/checkpoints/manipulation_pi05/params"
+        ),
+        num_workers=8 if os.getenv("DEBUG_MODE") != "true" else 2,
+        batch_size=16 if os.getenv("DEBUG_MODE") != "true" else 2,
+        num_train_steps=20_000,
+        # log often so TensorBoard shows curves within minutes of launch
+        log_interval=20,
+        resume=True,
+        save_interval=500 if os.getenv("DEBUG_MODE") != "true" else 100,
+    ),
+    # acot genie sim instruction and robust
+    TrainConfig(
+        name="acot_genie_sim_instruction_and_robust_20260525",
+        model=acot_vla.ACOTConfig(coarse_action_horizon=30, action_horizon=30, pi05=True, paligemma_variant="gemma_2b", action_expert_variant = "gemma_300m", adopt_explicit_action_reasoner=True, adopt_implicit_action_reasoner=True, query_based_implicit_extractor=False, attention_pooling_implicit_extractor=False, downsample_based_implicit_extractor=True),
+        data=LerobotACOTGo1DataConfig(
+            repo_id = [
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_block_color_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_block_number_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_block_shape_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_block_size_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_common_sense_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_object_type_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_specific_object_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/straighten_object_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_follow_logic_(or)_500",
+                "/mnt/public/linyiren/data/geniesim_data/instruction_and_robust/v21/pick_billards_color_500"
+            ],
+            assets=AssetsConfig(
+                assets_dir=None,
+                asset_id="/mnt/public/jincheng/train/lerobot/acot_genie_sim_instruction_and_robust_20260525",
+            ),
+            default_prompt=None,
+            state_mask = np.array(_transforms.make_bool_mask(-14, 18)).tolist(),
+            action_mask = np.array(_transforms.make_bool_mask(-16, 16)).tolist(),
+            extra_delta_transform=(True, True),
+            joint_action_shifts=(2, 1),
+            repack_transforms =_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "top_head": "observation.images.top_head",
+                                "hand_left": "observation.images.hand_left",
+                                "hand_right": "observation.images.hand_right",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt"
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True)
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.ACOTCheckpointWeightLoader(
+            "/mnt/public/zhonglinqing/pkgs/pi05_model/params"
+        ),
+        num_train_steps=50_000,
+        num_workers=24 if not os.getenv("DEBUG_MODE", default=False) == "true" else 1,
+        batch_size=256 if not os.getenv("DEBUG_MODE", default=False) == "true" else 16,
+        save_interval=10000,
+        freeze_filter=acot_vla.ACOTConfig(paligemma_variant="gemma_2b").get_freeze_filter(freeze_vision = False, freeze_llm = False, freeze_llm_embedder=False, freeze_dual_ae=[False, False])
+    ),
+    # genie sim manip (pi0, reuse pi05 manip 20260526 dataset)
+    TrainConfig(
+        name="pi0_genie_sim_manip_20260526",
+        model=pi0.Pi0Config(pi05=False, action_horizon=30, max_token_len=220),
+        data=LerobotGo1DataConfig(
+            repo_id=[
+                "/mnt/public/linyiren/data/geniesim_data/manipulation/v21/pour_workpiece",
+                "/mnt/public/linyiren/data/geniesim_data/manipulation/v21/open_door",
+                "/mnt/public/linyiren/data/geniesim_data/manipulation/v21/scoop_popcorn",
+                "/mnt/public/linyiren/data/geniesim_data/manipulation/v21/scoop_popcorn_part_2",
+                "/mnt/public/linyiren/data/geniesim_data/manipulation/v21/hold_pot",
+                "/mnt/public/linyiren/data/geniesim_data/manipulation/v21/place_block_into_box",
+                "/mnt/public/linyiren/data/geniesim_data/manipulation/v21/take_wrong_item_shelf",
+                "/mnt/public/linyiren/data/geniesim_data/manipulation/v21/stock_and_straighten_shelf",
+                "/mnt/public/linyiren/data/geniesim_data/manipulation/v21/stock_and_straighten_shelf_part_2",
+                "/mnt/public/linyiren/data/geniesim_data/manipulation/v21/sorting_packages_part_1",
+                "/mnt/public/linyiren/data/geniesim_data/manipulation/v21/sorting_packages_part_2",
+                "/mnt/public/linyiren/data/geniesim_data/manipulation/v21/sorting_packages_part_3",
+                "/mnt/public/linyiren/data/geniesim_data/manipulation/v21/clean_the_desktop_part_1",
+                "/mnt/public/linyiren/data/geniesim_data/manipulation/v21/clean_the_desktop_part_2",
+                "/mnt/public/linyiren/data/geniesim_data/manipulation/v21/clean_the_desktop_part_3",
+            ],
+            assets=AssetsConfig(
+                assets_dir=None,
+                asset_id="/mnt/public/jincheng/train/lerobot/pi05_genie_sim_manip_20260526",
+            ),
+            default_prompt=None,
+            use_delta_joint_actions=True,
+            include_waist=True,
+            output_dim=21,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/public/public_datasets/VLA_weigths/PI0/params"),
+        num_workers=24 if not os.getenv("DEBUG_MODE", default=False) == "true" else 2,
+        batch_size=256 if not os.getenv("DEBUG_MODE", default=False) == "true" else 2,
+        num_train_steps=50_000,
+        resume=True,
+        save_interval=5000 if not os.getenv("DEBUG_MODE", default=False) == "true" else 1000,
+    ),
+    # genie sim 3.0 sim2real task config
+    TrainConfig(
+        name="s2r_select_color",
+        model=pi0.Pi0Config(pi05=True),
+        data=LerobotGo1DataConfig(
+            repo_id="/root/openpi/data/select_color/",
+            norm_stats_path="/root/openpi/checkpoints/select_color/29999/norm_stats.json",
+            default_prompt="",
+            use_delta_joint_actions=True,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_may21_280k_v1/params"),
+        exp_name="s2r_select_color",
+        num_train_steps=30_000,
+        num_workers=24,
+        batch_size=32 * 8,
+        save_interval=5000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="s2r_size_recognize",
+        model=pi0.Pi0Config(pi05=True),
+        data=LerobotGo1DataConfig(
+            repo_id="/root/openpi/data/recognize_size/",
+            norm_stats_path="/root/openpi/checkpoints/recognize_size/29999/norm_stats.json",
+            default_prompt="",
+            use_delta_joint_actions=True,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_may21_280k_v1/params"),
+        exp_name="s2r_size_recognize",
+        num_train_steps=30_000,
+        num_workers=24,
+        batch_size=32 * 8,
+        save_interval=5000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="s2r_grasp_targets",
+        model=pi0.Pi0Config(pi05=True),
+        data=LerobotGo1DataConfig(
+            repo_id="/root/openpi/data/grasp_targets/",
+            norm_stats_path="/root/openpi/checkpoints/grasp_targets/29999/norm_stats.json",
+            default_prompt="",
+            use_delta_joint_actions=True,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_may21_280k_v1/params"),
+        exp_name="s2r_grasp_targets",
+        num_train_steps=30_000,
+        num_workers=24,
+        batch_size=32 * 8,
+        save_interval=5000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="s2r_organize_items",
+        model=pi0.Pi0Config(pi05=True),
+        data=LerobotGo1DataConfig(
+            repo_id="/root/openpi/data/organize_items/",
+            norm_stats_path="/root/openpi/checkpoints/organize_items/29999/norm_stats.json",
+            default_prompt="",
+            use_delta_joint_actions=True,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_may21_280k_v1/params"),
+        exp_name="s2r_organize_items",
+        num_train_steps=30_000,
+        num_workers=24,
+        batch_size=32 * 8,
+        save_interval=5000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="s2r_pack_in_supermarket",
+        model=pi0.Pi0Config(pi05=True),
+        data=LerobotGo1DataConfig(
+            repo_id="/mnt/public/E6/lerobot/8782/task_6944/",
+            norm_stats_path="/mnt/jincheng/train/lerobot/task_6944/norm_stats.json",
+            default_prompt="collect and organize table tennis",
+            use_delta_joint_actions=True,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_may21_280k_v1/params"),
+        exp_name="s2r_pack_in_supermarket",
+        num_train_steps=30_000,
+        num_workers=24,
+        batch_size=32 * 8,
+        save_interval=5000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="s2r_place_block_into_drawer",
+        model=pi0.Pi0Config(pi05=True),
+        data=LerobotGo1DataConfig(
+            repo_id="/mnt/public/jincheng/data/drawer/",
+            norm_stats_path="/mnt/jincheng/train/lerobot/task_7070/norm_stats.json",
+            default_prompt="organize the block into the drawer",
+            use_delta_joint_actions=True,
+            mask_gripper_state=True,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_may21_280k_v1/params"),
+        exp_name="s2r_place_block_into_drawer",
+        num_train_steps=30_000,
+        num_workers=24,
+        batch_size=32 * 8,
+        save_interval=5000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="s2r_bimanual_chip_handover",
+        model=pi0.Pi0Config(pi05=True),
+        data=LerobotGo1DataConfig(
+            repo_id="/mnt/jincheng/data/handover_chips",
+            norm_stats_path="/mnt/jincheng/train/lerobot/task_7332/norm_stats.json",
+            default_prompt="Handover chips",
+            use_delta_joint_actions=True,
+            mask_gripper_state=True,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_may21_280k_v1/params"),
+        exp_name="s2r_bimanual_chip_handover",
+        num_train_steps=30_000,
+        num_workers=24,
+        batch_size=32 * 8,
+        save_interval=5000,
+        wandb_enabled=False,
+    ),
+    TrainConfig(
+        name="s2r_sort_fruit",
+        model=pi0.Pi0Config(pi05=True),
+        data=LerobotGo1DataConfig(
+            repo_id="/mnt/public/jincheng/data/sort_fruit",
+            norm_stats_path="/mnt/jincheng/train/lerobot/task_7453/norm_stats.json",
+            default_prompt="Sort the fruit",
+            use_delta_joint_actions=True,
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_may21_280k_v1/params"),
+        exp_name="s2r_sort_fruit",
+        num_train_steps=15_000,
+        num_workers=24,
+        batch_size=32 * 8,
+        save_interval=5000,
+        wandb_enabled=False,
+    ),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

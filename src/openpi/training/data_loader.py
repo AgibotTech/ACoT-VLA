@@ -6,6 +6,7 @@ from typing import Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
+import random
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
@@ -29,18 +30,24 @@ class Dataset(Protocol[T_co]):
 
 
 class SafeDataset(Dataset):
-    def __init__(self, dataset: Dataset):
+    def __init__(self, dataset: Dataset, seed: int = 0):
         self.dataset = dataset
+        # Per-instance RNG so resampling on errors is deterministic and worker-local.
+        self._rng = random.Random(seed)
 
     def __len__(self) -> int:
         return len(self.dataset)
 
     def __getitem__(self, index: SupportsIndex):
         try:
-            return self.dataset[index]
+            val = self.dataset[index]
+            if val is None:
+                raise ValueError("Dataset returned None")
+            return val
         except Exception as e:
-            print(f"[Data Load Error] Skipping index {index} due to: {e}")
-            return None
+            print(f"[Data Load Error] Index {index} failed due to: {e}. Resampling...")
+            new_index = self._rng.randint(0, len(self.dataset) - 1)
+            return self.__getitem__(new_index)
     
     def __getattr__(self, name):
         if name == 'dataset':
@@ -203,7 +210,10 @@ def create_torch_dataset(
         if data_config.prompt_from_hl_instruction:
             for n, d in enumerate(dataset._datasets):
                 dataset._datasets[n] = TransformedDataset(
-                    d,[_transforms.PromptFromHighlevelInstruction(dataset_metas[n].info['instruction_segments'])]
+                    d, [_transforms.PromptFromHighlevelInstruction(
+                        dataset_metas[n].info['instruction_segments'],
+                        high_level_instructions=dataset_metas[n].info.get('high_level_instruction'),
+                    )]
                 )
         for i, d in enumerate(dataset._datasets):
             print(f"Dataset {i} has {len(d)} frames.")
@@ -221,7 +231,10 @@ def create_torch_dataset(
         if data_config.prompt_from_task:
             dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
         if data_config.prompt_from_hl_instruction:
-            dataset = TransformedDataset(dataset, [_transforms.PromptFromHighlevelInstruction(dataset_meta.info['instruction_segments'])])
+            dataset = TransformedDataset(dataset, [_transforms.PromptFromHighlevelInstruction(
+                dataset_meta.info['instruction_segments'],
+                high_level_instructions=dataset_meta.info.get('high_level_instruction'),
+            )])
 
     return dataset
 
@@ -232,6 +245,7 @@ def create_rlds_dataset(
     batch_size: int,
     *,
     shuffle: bool = False,
+    seed: int = 0,
 ) -> Dataset:
     # At the moment, we only support DROID for RLDS datasets.
     return DroidRldsDataset(
@@ -240,6 +254,7 @@ def create_rlds_dataset(
         shuffle=shuffle,
         action_chunk_size=action_horizon,
         action_space=data_config.action_space,
+        seed=seed,
     )
 
 
@@ -314,6 +329,7 @@ def create_data_loader(
             shuffle=shuffle,
             num_batches=num_batches,
             skip_norm_stats=skip_norm_stats,
+            seed=config.seed,
         )
     return create_torch_data_loader(
         data_config,
@@ -365,10 +381,10 @@ def create_torch_data_loader(
     sampler = None
     if data_config.dataloader_sampler != '':
         from openpi.training.sampler import FrameSampler
-        sampler = FrameSampler(dataset, data_config.dataloader_sampler)
+        sampler = FrameSampler(dataset, data_config.dataloader_sampler, seed=seed)
         shuffle = False
 
-    dataset = SafeDataset(dataset)
+    dataset = SafeDataset(dataset, seed=seed)
     data_loader = TorchDataLoader(
         dataset,
         local_batch_size=batch_size // jax.process_count(),
@@ -395,6 +411,7 @@ def create_rlds_data_loader(
     skip_norm_stats: bool = False,
     shuffle: bool = False,
     num_batches: int | None = None,
+    seed: int = 0,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create an RLDS data loader for training.
 
@@ -412,7 +429,7 @@ def create_rlds_data_loader(
             number of batches in the dataset, the data loader will loop over the dataset.
             If not provided, will iterate over the dataset indefinitely.
     """
-    dataset = create_rlds_dataset(data_config, action_horizon, batch_size, shuffle=shuffle)
+    dataset = create_rlds_dataset(data_config, action_horizon, batch_size, shuffle=shuffle, seed=seed)
     dataset = transform_iterable_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats, is_batched=True)
 
     data_loader = RLDSDataLoader(
@@ -533,11 +550,18 @@ def _collate_fn(items):
 
 
 def _worker_init_fn(worker_id: int) -> None:
-    """Tell JAX inside the worker process not to preallocate the GPU memory."""
+    """Configure JAX and seed Python/NumPy RNGs inside each worker process."""
     # NOTE: This is called after jax is imported inside the worker process. This
     # means that this approach will not work for selecting the backend.
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+
+    # PyTorch derives `torch.initial_seed()` per-worker from the seeded generator
+    # passed to DataLoader, so this gives us a deterministic, worker-distinct seed
+    # whenever the user sets `config.seed`. Mask to 32 bits because numpy requires it.
+    base_seed = torch.initial_seed() & 0xFFFF_FFFF
+    random.seed(base_seed)
+    np.random.seed(base_seed)
 
 
 class RLDSDataLoader:

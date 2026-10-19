@@ -9,6 +9,7 @@ import jax.numpy as jnp
 from typing_extensions import override
 
 from openpi.models import model as _model
+from openpi.models import rtc as _rtc
 import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
@@ -323,7 +324,30 @@ class Pi0(_model.BaseModel):
         observation: _model.Observation,
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
+        prev_chunk_left_over: at.ArrayLike | None = None,
+        inference_delay: int = 0,
+        execution_horizon: int | None = None,
+        rtc_max_guidance_weight: float = 10.0,
+        rtc_prefix_attention_schedule: str = "linear",
+        rtc_dim_mask: at.ArrayLike | None = None,
     ) -> _model.Actions:
+        """Sample an action chunk by flow matching from t=1 (noise) to t=0 (actions), with optional RTC guidance.
+
+        Args:
+            rng: PRNG key for the initial noise.
+            observation: Batched observation.
+            num_steps: Number of Euler denoising steps.
+            prev_chunk_left_over: Optional [b or 1, ah, ad] (or [ah, ad]) previous chunk's unexecuted rows in
+                normalized model space, re-anchored to the current state and padded to ``ah``. None disables RTC.
+            inference_delay: Scalar int, leading rows that execute before this chunk lands (fully guided).
+            execution_horizon: Scalar int, number of leading rows guided at all; None uses ``action_horizon``.
+            rtc_max_guidance_weight: Scalar upper bound on the RTC guidance weight.
+            rtc_prefix_attention_schedule: Static ramp shape, one of "linear", "exp", "zeros", "ones".
+            rtc_dim_mask: Optional [ad] 0/1 mask of action dims the leftover is valid for.
+
+        Returns:
+            [b, ah, ad] sampled actions.
+        """
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
@@ -339,35 +363,41 @@ class Pi0(_model.BaseModel):
 
         def step(carry):
             x_t, time = carry
-            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size)
-            )
-            # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
-            # other
-            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
-            # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
-            # prefix tokens
-            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
-            # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
-            # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
-            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
-            assert full_attn_mask.shape == (
-                batch_size,
-                suffix_tokens.shape[1],
-                prefix_tokens.shape[1] + suffix_tokens.shape[1],
-            )
-            # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
-            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            def denoise_fn(input_x_t):
+                suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                    observation, input_x_t, jnp.broadcast_to(time, batch_size)
+                )
+                suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+                prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+                full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+                assert full_attn_mask.shape == (
+                    batch_size,
+                    suffix_tokens.shape[1],
+                    prefix_tokens.shape[1] + suffix_tokens.shape[1],
+                )
+                positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
 
-            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-                [None, suffix_tokens],
-                mask=full_attn_mask,
-                positions=positions,
-                kv_cache=kv_cache,
-                adarms_cond=[None, adarms_cond],
+                (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                    [None, suffix_tokens],
+                    mask=full_attn_mask,
+                    positions=positions,
+                    kv_cache=kv_cache,
+                    adarms_cond=[None, adarms_cond],
+                )
+                assert prefix_out is None
+                return self.action_out_proj(suffix_out[:, -self.action_horizon :])
+
+            v_t = _rtc.guided_velocity(
+                x_t,
+                time=time,
+                denoise_fn=denoise_fn,
+                prev_chunk_left_over=prev_chunk_left_over,
+                inference_delay=inference_delay,
+                execution_horizon=self.action_horizon if execution_horizon is None else execution_horizon,
+                max_guidance_weight=rtc_max_guidance_weight,
+                prefix_attention_schedule=rtc_prefix_attention_schedule,
+                dim_mask=rtc_dim_mask,
             )
-            assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
             return x_t + dt * v_t, time + dt
 

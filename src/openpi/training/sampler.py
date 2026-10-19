@@ -42,7 +42,8 @@ def sample_subtask(dataset):
             tasks = instruction_segment[str(ep_idx)]
             for subtask in tasks:
                 local_start = subtask["start_frame_index"] + local_episode_start
-                local_end = subtask["success_frame_index"] + local_episode_start
+                end_frame_key = "success_frame_index" if "success_frame_index" in subtask else "end_frame_index"
+                local_end = subtask[end_frame_key] + local_episode_start
                 
                 instruction = subtask["instruction"].lower()
                 is_reset = any(k in instruction for k in ['reset', 'return', 'default'])
@@ -67,9 +68,9 @@ class FrameSampler(torch.utils.data.Sampler):
     """
     Custom sampler that only samples data indices falling within specified intervals
     """
-    def __init__(self, dataset, sampler_type):
+    def __init__(self, dataset, sampler_type, seed: int = 0):
         valid_intervals = self.parse_dataset(dataset, sampler_type)
-        self.sample_frames(valid_intervals, len(dataset))
+        self.sample_frames(valid_intervals, len(dataset), seed=seed)
 
     def parse_dataset(self, dataset, sampler_type):
         """
@@ -81,31 +82,31 @@ class FrameSampler(torch.utils.data.Sampler):
         else:
             raise ValueError(f"Invalid sampler type: {sampler_type}")
 
-    def sample_frames(self, intervals, dataset_size):
+    def sample_frames(self, intervals, dataset_size, seed: int = 0):
         """
         Args:
             intervals: List of (start_index, end_index) tuples
             dataset_size: Total size of the dataset
+            seed: RNG seed used to shuffle the valid indices deterministically.
         """
         self.intervals = intervals
         self.dataset_size = dataset_size
-        
+
         # Pre-compute all valid indices
         self.valid_indices = []
         for start_idx, end_idx in intervals:
             # Ensure indices are within dataset bounds
             start_idx = max(0, start_idx)
             end_idx = min(dataset_size - 1, end_idx)
-            
+
             # Add all indices within the interval
             self.valid_indices.extend(range(start_idx, end_idx + 1))
-        
+
         # Remove duplicates and sort
         self.valid_indices = sorted(list(set(self.valid_indices)))
         print(f"Total {len(self.valid_indices)} valid indices,", 'original:', dataset_size)
 
-        import random
-        random.shuffle(self.valid_indices)
+        random.Random(seed).shuffle(self.valid_indices)
     
     def __iter__(self):
         return iter(self.valid_indices)

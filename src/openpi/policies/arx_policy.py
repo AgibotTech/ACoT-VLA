@@ -78,9 +78,9 @@ class ARXInputs(transforms.DataTransformFn):
         # Add actions if present
         if "actions" in data:
             actions = data["actions"]
-            if self.action_mask is not None:
-                actions[:, self.action_mask[: actions.shape[1]]] = 0
             actions = transforms.pad_to_dim(actions, self.action_dim)
+            if self.action_mask is not None:
+                actions[:, self.action_mask] = 0
             if actions.ndim > 2 and actions.shape[0] == 1:
                 actions = actions.squeeze()
             inputs["actions"] = actions
@@ -183,9 +183,9 @@ class ARXACOTInputs(transforms.DataTransformFn):
         for key in ['coarse_actions', 'actions']:
             if key in data:
                 actions = data[key]
-                if self.action_mask is not None:
-                    actions[:, self.action_mask[: actions.shape[1]]] = 0
                 actions = transforms.pad_to_dim(actions, self.action_dim)
+                if self.action_mask is not None:
+                    actions[:, self.action_mask] = 0
                 if actions.ndim > 2 and actions.shape[0] == 1:
                     actions = actions.squeeze()
                 inputs[key] = actions

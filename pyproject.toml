@@ -60,7 +60,9 @@ rlds = [
 ]
 
 [tool.uv]
-override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
+# nvidia-nccl-cu12: torch cu126 pins 2.26.2 (built with CUDA 12.2, no Blackwell sm_120 kernels);
+# multi-GPU collectives on RTX PRO 6000 crash with CUDA_ERROR_ILLEGAL_ADDRESS. 2.27.3 is a CUDA 12.9 build.
+override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74", "nvidia-nccl-cu12==2.27.3"]
 
 [tool.uv.sources]
 openpi-client = { workspace = true }
@@ -128,6 +130,10 @@ force-single-line = true
 force-sort-within-sections = true
 single-line-exclusions = ["collections.abc", "typing", "typing_extensions"]
 known-third-party = ["wandb"]
+
+[tool.ruff.lint.pydocstyle]
+# Only applies where "D" is selected: the fork-owned files hook in .pre-commit-config.yaml.
+convention = "google"
 
 [build-system]
 requires = ["hatchling"]

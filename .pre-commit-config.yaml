@@ -14,3 +14,8 @@ repos:
       - id: ruff
         args: [--fix]
       - id: ruff-format
+      # Google docstrings, enforced only on fork-owned modules so upstream openpi files stay merge-clean.
+      - id: ruff
+        name: ruff (google docstrings, fork-owned)
+        args: [--select, D]
+        files: ^(src/openpi/models/rtc\.py|src/openpi/serving/rtc_stream_server\.py|scripts/(serve_rtc_stream|rtc_stream_client|validate_actions|validate_checkpoint)\.py|scripts/geniesim/.*\.py)$
